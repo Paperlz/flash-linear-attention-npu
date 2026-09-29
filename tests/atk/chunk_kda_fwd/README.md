@@ -44,3 +44,48 @@ bash tests/atk/run_test_cpu.sh -op=chunk_kda_fwd -npu_device_id=0 -scope=accurac
 ```
 
 性能、确定性、mssanitizer 和用例生成均通过统一脚本的对应 `-scope` 执行。
+
+## K/score 缓冲区复用回归
+
+原始 Case 251、259、267 及更长单序列导出用例覆盖最终 kg 的原始 K 读取。
+额外的 12 条用例覆盖 BF16/FP16、四种布局、GVA、tail、chunk=128/V=256，
+并保留 initial_state 与 final_state 的检查：
+
+```bash
+python tests/atk/chunk_kda_fwd/scripts/gen_kg_lifetime_cases.py \
+  <case_dir>/atk_chunk_kda_fwd.json
+
+cd tests/atk/chunk_kda_fwd
+atk node --name npu_dut --backend npu --devices 0 --output_path <output_dir> \
+  node --name cpu_golden --backend cpu --output_path <output_dir> \
+  task -c <case_dir>/atk_chunk_kda_fwd.json --task accuracy --bm_device cpu \
+  -p ./executor_chunk_kda_fwd.py --gm_init_flag -mt 1 -to 14400
+```
+
+该生成器保持 Case 251 的模型输入分布和混合容差，改变的用例参数均记录在 JSON。
+验证结果和已知问题见 [第五轮报告](scripts/chunk_kda_fwd_round5_kg_lifetime_report.md)。
+
+Case 250 的恢复复测、设备任务分解及当前瓶颈见 [第七轮记录](scripts/chunk_kda_fwd_round7_perf_resume_report.md)。
+
+正常执行 PMU、部分核时间与下一轮优化候选见 [第八轮 profiling 报告](scripts/chunk_kda_fwd_round8_profile_report.md)。
+
+尾部V切片候选的三组A/B、撤回结论和边界复现见 [第九轮实验报告](scripts/chunk_kda_fwd_round9_vslice_report.md)。
+
+
+## R31 提交测试集
+
+按用户要求固定为 20 个原始用例（ID250–269）和 20 个代表性泛化用例，不再执行维度笛卡尔积。
+atk_chunk_kda_fwd_fixed20.json 与 atk_chunk_kda_fwd_general20.json 合计 40 例，默认精度 JSON 即二者合并。
+泛化集覆盖两种 q dtype、八种 q/g/beta dtype 组合、chunk64/128、BSND/BNSD/TND/NTD、GVA、
+短尾块、变长序列、可选状态、raw/preactivated gate；保留已知失败场景，不能把缩减规模记作精度通过。
+
+任务书 §2.2 的中间输出 FP32 与参考实现存在差异，按用户确认保留参考 BF16/FP16 接口；最终状态 FP32。
+官方精度复核采用 AscendOpTest 原始 compare_default，并逐个比较全部公开输出。
+
+~~~bash
+python tests/atk/chunk_kda_fwd/scripts/gen_legal_domain_cases.py --output-dir /tmp/kda-cases --update-default
+bash tests/atk/run_test_cpu.sh -op=chunk_kda_fwd -npu_device_id=0 -soc=ascend950 -scope=accuracy
+python tests/atk/chunk_kda_fwd/scripts/compare_ascend_op_test.py --atk-output <ATK输出目录> --ascend-op-test <AscendOpTest仓库> --report compare.json
+~~~
+
+精度、性能、确定性、内存检测分项结果以交付 reports 和 evidence 为准；未完成或失败项不得记作通过。

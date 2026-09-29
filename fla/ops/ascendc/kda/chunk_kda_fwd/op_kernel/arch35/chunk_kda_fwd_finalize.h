@@ -501,39 +501,48 @@ private:
                                                 uint64_t start, uint64_t curT, uint64_t rowBegin,
                                                 uint64_t rows)
     {
-        LocalTensor<float> vRow = exp2Buf_.Get<float>();
+        LocalTensor<float> values = vecBuf_.Get<float>()[8192];
+        LocalTensor<T> valuesTyped = vecBuf_.Get<T>()[32768];
         LocalTensor<T> coefficientTyped = gateWritebackBuf_.Get<T>();
-        LocalTensor<float> coefficients = gateWritebackBuf_.Get<float>()[BT_];
+        LocalTensor<float> coefficients = gateWritebackBuf_.Get<float>()[256];
+        const uint32_t count = static_cast<uint32_t>(curT * V_);
+        CopyVectorIn(valuesTyped, propagatedVNew_, KVOffset(b, hv, start, 0, V_), count);
+        SetFlag<HardEvent::MTE2_V>(mte2ToVEvent_);
+        WaitFlag<HardEvent::MTE2_V>(mte2ToVEvent_);
+        Cast(values, valuesTyped, RoundMode::CAST_NONE, count);
+        PipeBarrier<PIPE_V>();
         for (uint64_t localRow = 0; localRow < rows; ++localRow) {
-            LocalTensor<float> dstRow = dst[localRow * V_];
-            CopyVectorIn(
-                coefficientTyped, preparedAqk_,
-                AOffset(b, hv, start + rowBegin + localRow, 0), curT);
+            CopyVectorIn(coefficientTyped, preparedAqk_,
+                         AOffset(b, hv, start + rowBegin + localRow, 0), curT);
             SetFlag<HardEvent::MTE2_V>(mte2ToVEvent_);
             WaitFlag<HardEvent::MTE2_V>(mte2ToVEvent_);
-            Cast(
-                coefficients, coefficientTyped, RoundMode::CAST_NONE,
-                static_cast<uint32_t>(curT));
+            Cast(coefficients, coefficientTyped, RoundMode::CAST_NONE, static_cast<uint32_t>(curT));
             PipeBarrier<PIPE_V>();
-            SetFlag<HardEvent::V_S>(vToSEvent_);
-            WaitFlag<HardEvent::V_S>(vToSEvent_);
-            Duplicate(dstRow, 0.0f, static_cast<uint32_t>(V_));
-            PipeBarrier<PIPE_V>();
-            for (uint64_t j = 0; j < curT; ++j) {
-                LoadAsFloatRow(
-                    propagatedVNew_, KVOffset(b, hv, start + j, 0, V_), vRow, V_);
-                float weight = coefficients.GetValue(j);
-                SetFlag<HardEvent::S_V>(sToVEvent_);
-                WaitFlag<HardEvent::S_V>(sToVEvent_);
-                Muls(vRow, vRow, weight, static_cast<uint32_t>(V_));
-                PipeBarrier<PIPE_V>();
-                Add(dstRow, dstRow, vRow, static_cast<uint32_t>(V_));
-                PipeBarrier<PIPE_V>();
-                SetFlag<HardEvent::V_MTE2>(vToMte2Event_);
-                WaitFlag<HardEvent::V_MTE2>(vToMte2Event_);
+            __ubuf__ float *out = (__ubuf__ float *)dst.GetPhyAddr() + localRow * V_;
+            __ubuf__ float *v = (__ubuf__ float *)values.GetPhyAddr();
+            __ubuf__ float *c = (__ubuf__ float *)coefficients.GetPhyAddr();
+            const uint16_t columns = static_cast<uint16_t>(V_);
+            const uint16_t reduceCount = static_cast<uint16_t>(curT);
+            const uint16_t tileCount = (columns + 63) / 64;
+            __VEC_SCOPE__
+            {
+                using namespace AscendC::MicroAPI;
+                RegTensor<float> acc, value, coefficient, product;
+                uint32_t remaining = columns;
+                for (uint16_t tile = 0; tile < tileCount; ++tile) {
+                    MaskReg mask = UpdateMask<float>(remaining);
+                    Duplicate(acc, 0.0f);
+                    for (uint16_t j = 0; j < reduceCount; ++j) {
+                        DataCopy(value, v + j * columns + tile * 64);
+                        DataCopy<float, LoadDist::DIST_BRC_B32>(coefficient, c + j);
+                        Mul(product, value, coefficient, mask);
+                        Add(acc, acc, product, mask);
+                    }
+                    DataCopy(out + tile * 64, acc, mask);
+                }
             }
-            SetFlag<HardEvent::S_MTE2>(sToMte2Event_);
-            WaitFlag<HardEvent::S_MTE2>(sToMte2Event_);
+            SetFlag<HardEvent::V_MTE2>(vToMte2Event_);
+            WaitFlag<HardEvent::V_MTE2>(vToMte2Event_);
         }
     }
 
@@ -1097,9 +1106,6 @@ private:
                                              uint64_t curT)
     {
 #if defined(__CCE_AICORE__) && __CCE_AICORE__ == 310
-        if (curT < KDA_CUBE_MIN_REDUCTION) {
-            return;
-        }
         SetLoadDataPaddingValue<T>(static_cast<T>(0));
         if (BT_ == 64 && curT == BT_) {
             ComputeOutputCubeStagedArch35(b, hv, chunkIdx, start, curT);
@@ -1202,14 +1208,12 @@ private:
             LocalTensor<float> outLocal = arena[2 * elems];
             LocalTensor<T> outTyped = gateWritebackBuf_.Get<T>();
 
+            CopyVectorIn(stateLocal, o_, KVOffset(b, hv, ti, 0, V_), elems);
+            SetFlag<HardEvent::MTE2_V>(mte2ToVEvent_);
+            WaitFlag<HardEvent::MTE2_V>(mte2ToVEvent_);
             if (curT < KDA_CUBE_MIN_REDUCTION) {
-                ComputeTailStateRows(
-                    stateLocal, b, hv, chunkIdx, start, tileRow, tileRows);
                 ComputeTailLocalRows(localLocal, b, hv, start, curT, tileRow, tileRows);
             } else {
-                CopyVectorIn(stateLocal, o_, KVOffset(b, hv, ti, 0, V_), elems);
-                SetFlag<HardEvent::MTE2_V>(mte2ToVEvent_);
-                WaitFlag<HardEvent::MTE2_V>(mte2ToVEvent_);
                 CopyVectorIn(localLocal, u_, KVOffset(b, hv, ti, 0, V_), elems);
                 SetFlag<HardEvent::MTE2_V>(mte2ToVEvent_);
                 WaitFlag<HardEvent::MTE2_V>(mte2ToVEvent_);

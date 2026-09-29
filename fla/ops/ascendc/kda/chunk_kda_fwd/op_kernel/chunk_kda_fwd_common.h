@@ -29,6 +29,12 @@
 #endif
 
 namespace KdaForward {
+// The state-update GEMM has M=K; K>128 needs an M tile that owns all rows.
+struct KdaFwdHTileShapesK256 {
+    using L1TileShape = tla::Shape<tla::Int<256>, tla::Int<256>, tla::Int<64>>;
+    using L0TileShape = tla::Shape<tla::Int<256>, tla::Int<256>, tla::Int<32>>;
+};
+
 
 using namespace AscendC;
 
@@ -247,7 +253,11 @@ __aicore__ inline void RunGenericBackEnd(
     const ChunkKdaFwdAddresses &addresses, GM_ADDR userWorkspace,
     const TilingData &tiling)
 {
-    if (tiling.vHeadDim > 128) {
+    if (tiling.kHeadDim > 128) {
+        RunFwdH<T, KdaFwdHTileShapesK256>(
+            initialState, cuSeqlens, chunkIndices, addresses,
+            userWorkspace, tiling);
+    } else if (tiling.vHeadDim > 128) {
         RunFwdH<T, Catlass::Gemm::Kernel::GDNFwdHTileShapes256>(
             initialState, cuSeqlens, chunkIndices, addresses,
             userWorkspace, tiling);
@@ -271,7 +281,11 @@ __aicore__ inline void RunGenericBackEnd(
     const ChunkKdaFwdAddresses &addresses, GM_ADDR userWorkspace,
     const TilingData &tiling, TPipe &pipe)
 {
-    if (tiling.vHeadDim > 128) {
+    if (tiling.kHeadDim > 128) {
+        RunFwdH<T, KdaFwdHTileShapesK256>(
+            initialState, cuSeqlens, chunkIndices, addresses,
+            userWorkspace, tiling);
+    } else if (tiling.vHeadDim > 128) {
         RunFwdH<T, Catlass::Gemm::Kernel::GDNFwdHTileShapes256>(
             initialState, cuSeqlens, chunkIndices, addresses,
             userWorkspace, tiling);

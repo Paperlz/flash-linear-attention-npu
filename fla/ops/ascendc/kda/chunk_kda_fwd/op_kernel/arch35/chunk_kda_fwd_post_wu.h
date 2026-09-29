@@ -53,6 +53,7 @@ constexpr float KDA_FP16_MAX = 65504.0f;
 constexpr uint32_t EXP2_UB_ELEMENTS = 256;
 constexpr uint32_t EXP2_UB_BYTES = EXP2_UB_ELEMENTS * (sizeof(float) + sizeof(uint16_t));
 constexpr uint32_t EXP2_EVENT_ID = 0;
+constexpr uint32_t KDA_CUBE_MIN_REDUCTION = 16;
 constexpr uint32_t KDA_SOLVE_BT = 64;
 constexpr uint32_t KDA_SOLVE_MATRIX_ELEMENTS = KDA_SOLVE_BT * KDA_SOLVE_BT;
 constexpr uint32_t KDA_SOLVE_SCRATCH_X = 0;
@@ -1110,27 +1111,18 @@ private:
         using LayoutTagC = Catlass::layout::RowMajor;
 #if defined(__CCE_AICORE__) && __CCE_AICORE__ == 310
         SetLoadDataPaddingValue<T>(static_cast<T>(0));
-        using WTileCopy = Catlass::Gemm::Tile::PackedTileCopyTla<KdaArchTag, ElementA, LayoutTagA, ElementB,
-                                                                 LayoutTagB, T, LayoutTagC>;
-#else
+#endif
         using WTileCopy = Catlass::Gemm::Tile::PackedTileCopyTla<KdaArchTag, ElementA, LayoutTagA, ElementB,
                                                                  LayoutTagB, float, LayoutTagC>;
-#endif
         using UTileCopy = Catlass::Gemm::Tile::PackedTileCopyTla<KdaArchTag, ElementA, LayoutTagA, ElementB,
                                                                  LayoutTagB, OUT_T, LayoutTagC>;
         using PostL1TileShape128 = tla::Shape<KdaInt128, KdaInt128, tla::_256>;
         using PostL0TileShape128 = tla::Shape<KdaInt128, KdaInt128, KdaInt128>;
         using PostL1TileShape256 = tla::Shape<KdaInt128, tla::_256, tla::_256>;
         using PostL0TileShape256 = tla::Shape<KdaInt128, tla::_256, KdaInt64>;
-#if defined(__CCE_AICORE__) && __CCE_AICORE__ == 310
-        using WBlockMmad = Catlass::Gemm::Block::BlockMmadTla<KdaDispatchPolicy, PostL1TileShape128,
-                                                               PostL0TileShape128,
-                                                               ElementA, ElementB, T, void, WTileCopy>;
-#else
         using WBlockMmad = Catlass::Gemm::Block::BlockMmadTla<KdaDispatchPolicy, PostL1TileShape128,
                                                                PostL0TileShape128,
                                                                ElementA, ElementB, float, void, WTileCopy>;
-#endif
         using UBlockMmad128 = Catlass::Gemm::Block::BlockMmadTla<KdaDispatchPolicy, PostL1TileShape128,
                                                                   PostL0TileShape128,
                                                                   ElementA, ElementB, OUT_T, void, UTileCopy>;
@@ -1142,29 +1134,21 @@ private:
         auto tensorA = tla::MakeTensor(preparedAqk_[AOffset(b, hv, start, 0)], layoutA,
                                        Catlass::Arch::PositionGM{});
 
-        {
+        // Keep the complete seed intact until every N tile has consumed it.
+        for (uint64_t col = 0; col < K_; col += 128) {
+            const uint32_t columns = static_cast<uint32_t>((K_ - col) > 128 ? 128 : K_ - col);
             LayoutTagB tagB = LayoutTagB::template MakeLayout<ElementB>(BT_, K_);
-#if defined(__CCE_AICORE__) && __CCE_AICORE__ == 310
-            LayoutTagC tagC = LayoutTagC::template MakeLayout<T>(BT_, K_);
-#else
             LayoutTagC tagC = LayoutTagC::template MakeLayout<float>(BT_, K_);
-#endif
             auto layoutB = tla::MakeLayoutFromTag(tagB);
             auto layoutC = tla::MakeLayoutFromTag(tagC);
-            Catlass::GemmCoord shape{static_cast<uint32_t>(curT), static_cast<uint32_t>(K_),
-                                     static_cast<uint32_t>(curT)};
+            Catlass::GemmCoord shape{static_cast<uint32_t>(curT), columns, static_cast<uint32_t>(curT)};
             auto tensorB = tla::MakeTensor(preparedQG_[KVOffset(b, hv, start, 0, K_)], layoutB,
                                            Catlass::Arch::PositionGM{});
-#if defined(__CCE_AICORE__) && __CCE_AICORE__ == 310
-            auto tensorC = tla::MakeTensor(w_[KVOffset(b, hv, start, 0, K_)], layoutC,
+            auto tensorC = tla::MakeTensor(h_[KVOffset(b, hv, start, 0, K_)], layoutC,
                                            Catlass::Arch::PositionGM{});
-#else
-            auto tensorC = tla::MakeTensor(h_[WScratchOffset(b, hv, chunkIdx, 0, 0)], layoutC,
-                                            Catlass::Arch::PositionGM{});
-#endif
             auto blockA = GetTile(tensorA, tla::MakeCoord(0, 0), tla::MakeShape(shape.m(), shape.k()));
-            auto blockB = GetTile(tensorB, tla::MakeCoord(0, 0), tla::MakeShape(shape.k(), shape.n()));
-            auto blockC = GetTile(tensorC, tla::MakeCoord(0, 0), tla::MakeShape(shape.m(), shape.n()));
+            auto blockB = GetTile(tensorB, tla::MakeCoord(0, col), tla::MakeShape(shape.k(), shape.n()));
+            auto blockC = GetTile(tensorC, tla::MakeCoord(0, col), tla::MakeShape(shape.m(), shape.n()));
             Catlass::Arch::Resource<KdaArchTag> wResource;
             WBlockMmad wBlockMmad(wResource);
             wBlockMmad(blockA, blockB, blockC, shape);
@@ -1422,14 +1406,10 @@ private:
                 tileRows = maxRows;
             }
             uint64_t elemCount = tileRows * K_;
-#if !defined(__CCE_AICORE__) || __CCE_AICORE__ != 310
-            uint64_t scratchBase = WScratchOffset(b, hv, chunkIdx, tileRow, 0);
-#else
+            const uint64_t scratchBase = KVOffset(b, hv, start + tileRow, 0, K_);
             (void)chunkIdx;
-#endif
             uint64_t token = start + tileRow;
 
-#if !defined(__CCE_AICORE__) || __CCE_AICORE__ != 310
             DataCopy(arena, h_[scratchBase], static_cast<uint32_t>(elemCount));
             SetFlag<HardEvent::MTE2_V>(mte2ToVEvent_);
             WaitFlag<HardEvent::MTE2_V>(mte2ToVEvent_);
@@ -1440,7 +1420,6 @@ private:
             DataCopy(w_[KVOffset(b, hv, token, 0, K_)], typedLocal, static_cast<uint32_t>(elemCount));
             SetFlag<HardEvent::MTE3_MTE2>(mte3ToMte2Event_);
             WaitFlag<HardEvent::MTE3_MTE2>(mte3ToMte2Event_);
-#endif
 
             LocalTensor<float> kLocal = arena;
             LocalTensor<float> gLocal = arena[elemCount];
@@ -1534,7 +1513,7 @@ private:
         uint64_t rowEnd = (curT * (subBlockIdx + 1)) / subBlockNum;
         for (uint64_t row = rowBegin; row < rowEnd; ++row) {
             ComputeTailWuRow(
-                preparedQG_, w_, AOffset(b, hv, start + row, 0), KVOffset(b, hv, start, 0, K_),
+                preparedQG_, h_, AOffset(b, hv, start + row, 0), KVOffset(b, hv, start, 0, K_),
                 KVOffset(b, hv, start + row, 0, K_), curT, K_);
             ComputeTailWuRow(
                 propagatedVNew_, u_, AOffset(b, hv, start + row, 0), KVOffset(b, hv, start, 0, V_),
@@ -1707,8 +1686,9 @@ private:
             return;
         }
 #if defined(__CCE_AICORE__) && __CCE_AICORE__ == 310
-        if (curT < BT_) {
+        if (curT < KDA_CUBE_MIN_REDUCTION) {
             ComputeTailWuVector(b, hv, chunkIdx, start, curT, subBlockIdx, subBlockNum);
+            Catlass::Arch::CrossCoreBarrier<0x1, PIPE_MTE3>();
             CopyScratchWAndFinalizeKg(
                 b, h, hv, chunkIdx, start, curT, subBlockIdx, subBlockNum);
             return;
@@ -1717,6 +1697,7 @@ private:
             ComputeTypicalKg(b, h, hv, start, curT, subBlockIdx, subBlockNum);
             return;
         } else {
+            Catlass::Arch::CrossCoreWaitFlagWithReverse<0x2, PIPE_MTE2>(syncDoneFlag_);
             CopyScratchWAndFinalizeKg(b, h, hv, chunkIdx, start, curT, subBlockIdx, subBlockNum);
         }
 #else
@@ -1740,8 +1721,17 @@ private:
         if (curT == 0 || !UsePostWuCube(curT)) {
             return;
         }
+#if defined(__CCE_AICORE__) && __CCE_AICORE__ == 310
+        if (curT < KDA_CUBE_MIN_REDUCTION) {
+            return;
+        }
+#endif
         ComputePostWuCube(b, hv, chunkIdx, start, curT);
-#if !defined(__CCE_AICORE__) || __CCE_AICORE__ != 310
+#if defined(__CCE_AICORE__) && __CCE_AICORE__ == 310
+        if (!UsePostWuCubeArch35(curT)) {
+            Catlass::Arch::CrossCoreSetFlagWithReverse<0x2, PIPE_FIX>(syncDoneFlag_);
+        }
+#else
         Catlass::Arch::CrossCoreSetFlagWithReverse<0x2, PIPE_FIX>(syncDoneFlag_);
 #endif
     }
@@ -1838,6 +1828,8 @@ private:
                     (void)h;
                     if (end - start == BT_) {
                         ProcessPreparedTailSingleArch35(b, hv, start, BT_);
+                    } else {
+                        ProcessChunkPostAicTyped(b, hv, chunkIdx, start, end);
                     }
                 }
             }
@@ -1857,6 +1849,9 @@ private:
             bool resolved = ResolveHeadMajorChunk(task, seq, b, h, hv, chunkIdx, start, end);
             uint64_t curT = resolved ? end - start : 0;
             if (!resolved || !UseFullPostWuPipelineArch35(curT)) {
+                if (resolved) {
+                    ProcessChunkPostAicTyped(b, hv, chunkIdx, start, end);
+                }
                 (void)seq;
                 (void)h;
                 ++task;

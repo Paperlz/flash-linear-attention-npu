@@ -1,5 +1,7 @@
 # ChunkKdaFwd
 
+R31 交付状态：固定 20/20、泛化 15/20 通过，仍有 5 例精度失败。完整结论及未完成项目见 [验证记录](docs/validation.md)。
+
 ## 功能
 
 `ChunkKdaFwd` 对齐不涉及 CP 切分的 FLA `chunk_kda_fwd` 顶层语义。公共接口接收 raw gate 或已激活的
@@ -107,8 +109,9 @@ Python 返回顺序为：
 
 ## 验证
 
-唯一用例规格是 `tests/op_cases/chunk_kda_fwd.json`。数值测试位于
-`tests/operators/chunk_kda_fwd/accuracy/`，性能使用 `tests/operators/chunk_kda_fwd/performance/profile.py`
-和 `msopprof`。
+精度用例和 CPU FP64 标杆位于 `tests/atk/chunk_kda_fwd/`，通过
+`tests/atk/run_test_cpu.sh -op=chunk_kda_fwd -scope=accuracy` 执行。
+性能使用同一入口的 `-scope=performance`，统计 ATK `performance_device` 的设备耗时。
+复现步骤、补充回归和逐轮报告见该 ATK 目录的 README。
 
 完整 API 见 [API 文档](docs/api.md)，阶段和内存设计见 [设计文档](docs/design.md)。

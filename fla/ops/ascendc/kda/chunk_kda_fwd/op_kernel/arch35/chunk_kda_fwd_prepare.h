@@ -508,6 +508,15 @@ static __simd_vf__ inline void PrepareKdaGateQwKgRegbase(
             StoreKdaGateRegbasePair<OutputT>(
                 kgOut + offset, outputZeroReg, outputOneReg, inputMask, floatMask);
 
+            if constexpr (EXPORT_FINAL_KG) {
+                // wOut aliases k. Keep the original K value in registers instead
+                // of reloading the score-scaled value written to that UB slot.
+                BuildKdaGateRegbaseExp<InputT, true, true>(
+                    finalNegZeroReg, finalNegOneReg, gateZeroReg, gateOneReg,
+                    finalRef + col, floatMask);
+                MulFloatTwoReg(finalNegZeroReg, finalNegOneReg, inputZeroReg, inputOneReg,
+                               finalNegZeroReg, finalNegOneReg, floatMask);
+            }
             if constexpr (STORE_DIRECT) {
                 LoadKdaGateRegbasePair<InputT>(inputZeroReg, inputOneReg, v + offset, inputMask);
                 Mul(outputZeroReg, inputZeroReg, betaReg, floatMask);
@@ -516,27 +525,9 @@ static __simd_vf__ inline void PrepareKdaGateQwKgRegbase(
                     vDirect + offset, outputZeroReg, outputOneReg, inputMask, floatMask);
             }
             if constexpr (EXPORT_FINAL_KG) {
-                RegTensor<float> finalRefZeroReg;
-                RegTensor<float> finalRefOneReg;
-                LoadAlign<float, LoadDist::DIST_DINTLV_B32>(
-                    finalRefZeroReg, finalRefOneReg, finalRef + col);
-                SubFloatTwoReg(finalNegZeroReg, finalNegOneReg,
-                               finalRefZeroReg, finalRefOneReg,
-                               gateZeroReg, gateOneReg, floatMask);
-                Muls(finalNegZeroReg, finalNegZeroReg, LN2, floatMask);
-                Muls(finalNegOneReg, finalNegOneReg, LN2, floatMask);
-                MinsFloatTwoReg(finalNegZeroReg, finalNegOneReg,
-                                finalNegZeroReg, finalNegOneReg,
-                                KDA_EXP_INPUT_MAX, floatMask);
-                Maxs(finalNegZeroReg, finalNegZeroReg, KDA_EXP_INPUT_MIN, floatMask);
-                Maxs(finalNegOneReg, finalNegOneReg, KDA_EXP_INPUT_MIN, floatMask);
-                ExpFloatTwoReg(finalNegZeroReg, finalNegOneReg,
-                               finalNegZeroReg, finalNegOneReg, floatMask);
-                LoadKdaGateRegbasePair<InputT>(inputZeroReg, inputOneReg, k + offset, inputMask);
-                MulFloatTwoReg(outputZeroReg, outputOneReg, inputZeroReg, inputOneReg,
-                               finalNegZeroReg, finalNegOneReg, floatMask);
+                // finalKgOut may reuse v only after its direct value was read.
                 StoreKdaGateRegbasePair<InputT>(
-                    finalKgOut + offset, outputZeroReg, outputOneReg, inputMask, floatMask);
+                    finalKgOut + offset, finalNegZeroReg, finalNegOneReg, inputMask, floatMask);
             }
         }
     }
@@ -712,8 +703,9 @@ static __simd_vf__ inline void ForwardSubDiag16PairStridedRegbase(
         LoadAlign(secondReg, matrix + secondOffset);
         Adds(firstReg, firstReg, 1.0f, diagMask);
         Adds(secondReg, secondReg, 1.0f, diagMask);
-        StoreAlign(matrix + firstOffset, firstReg, rowMask);
-        StoreAlign(matrix + secondOffset, secondReg, rowMask);
+        // Adds uses ZEROING; store only selected diagonal elements.
+        StoreAlign(matrix + firstOffset, firstReg, diagMask);
+        StoreAlign(matrix + secondOffset, secondReg, diagMask);
     }
 }
 
@@ -904,6 +896,8 @@ public:
         isVarLen_ = tiling.isVarLen;
         inputSequenceMajor_ = tiling.inputSequenceMajor;
         fusePostWu_ = tiling.fusePostWu;
+        fusePostWuIntoFwdH_ = tiling.fusePostWuIntoFwdH;
+        storeGk_ = tiling.storeGk;
         computeGateInPrepare_ = tiling.computeGateInPrepare;
         hasALog_ = tiling.hasALog;
         hasDtBias_ = tiling.hasDtBias;
@@ -1377,6 +1371,15 @@ private:
         SetFlag<HardEvent::MTE2_V>(mte2ToVEvent_);
     }
 
+    // gk is materialized into GM only to hand the gate to a later pipeline
+    // stage. When FwdH absorbs post-WU and the user does not request gk, the
+    // single downstream consumer is the fused K-gate update, which reads the
+    // chunk-final gate row; every other row would be dead GM traffic.
+    __aicore__ inline bool GateScratchMaterializeLastRowOnly() const
+    {
+        return fusePostWuIntoFwdH_ && !storeGk_;
+    }
+
     __aicore__ inline void MaterializeRawGateChunkArch35(
         uint64_t b, uint64_t hv, uint64_t start, uint64_t rows)
     {
@@ -1436,10 +1439,21 @@ private:
                         expA, lowerBound_);
                 }
                 PipeBarrier<PIPE_V>();
-                SetFlag<HardEvent::V_MTE3>(vToMte3Event_);
-                WaitFlag<HardEvent::V_MTE3>(vToMte3Event_);
-                CopyVectorOut(gk_, KVOffset(b, hv, start + tileRow, 0, K_), gate,
-                              currentRows * K_);
+                if (!GateScratchMaterializeLastRowOnly()) {
+                    SetFlag<HardEvent::V_MTE3>(vToMte3Event_);
+                    WaitFlag<HardEvent::V_MTE3>(vToMte3Event_);
+                    CopyVectorOut(gk_, KVOffset(b, hv, start + tileRow, 0, K_), gate,
+                                  currentRows * K_);
+                } else if (tile + 1 == tileCount) {
+                    // Only the chunk-final gate row is consumed downstream by the
+                    // fused FwdH K-gate state update. The whole chunk stays
+                    // accumulated in UB; the private gk scratch only needs that row.
+                    LocalTensor<float> lastGateRow = gate[(currentRows - 1) * K_];
+                    SetFlag<HardEvent::V_MTE3>(vToMte3Event_);
+                    WaitFlag<HardEvent::V_MTE3>(vToMte3Event_);
+                    CopyVectorOut(gk_, KVOffset(b, hv, start + rows - 1, 0, K_),
+                                  lastGateRow, K_);
+                }
             }
             SetFlag<HardEvent::MTE3_V>(mte3ToVEvent_);
             WaitFlag<HardEvent::MTE3_V>(mte3ToVEvent_);
@@ -1718,7 +1732,7 @@ private:
 #if defined(__CCE_AICORE__) && __CCE_AICORE__ == 310
             bool fuseQwKg = SAFE_GATE && BT_ == 64 && K_ == 128 && V_ == 128 && subBlockNum == 1;
             if (fuseQwKg) {
-                PrepareKdaGateQwKgRegbase<T, SCORE_T, GK_T, true, true, false, true>(
+                PrepareKdaGateQwKgRegbase<T, SCORE_T, GK_T, true, true, exportFinalKg, true>(
                     (__ubuf__ T *)reinterpret_cast<uint64_t>(qTyped.GetPhyAddr()),
                     (__ubuf__ T *)reinterpret_cast<uint64_t>(kTyped.GetPhyAddr()),
                     (__ubuf__ SCORE_T *)reinterpret_cast<uint64_t>(qScore.GetPhyAddr()),
@@ -1728,26 +1742,13 @@ private:
                     (__ubuf__ T *)reinterpret_cast<uint64_t>(directW.GetPhyAddr()),
                     (__ubuf__ T *)reinterpret_cast<uint64_t>(vTyped.GetPhyAddr()),
                     (__ubuf__ T *)reinterpret_cast<uint64_t>(directV.GetPhyAddr()),
-                    nullptr,
+                    (__ubuf__ T *)reinterpret_cast<uint64_t>(vTyped.GetPhyAddr()),
                     (__ubuf__ float *)reinterpret_cast<uint64_t>(betaFp32.GetPhyAddr()),
                     (__ubuf__ GK_T *)reinterpret_cast<uint64_t>(gateTyped.GetPhyAddr()),
                     (__ubuf__ float *)reinterpret_cast<uint64_t>(refFp32.GetPhyAddr()),
-                    nullptr,
+                    (__ubuf__ float *)reinterpret_cast<uint64_t>(finalRefFp32.GetPhyAddr()),
                     static_cast<uint16_t>(tileRows), static_cast<uint16_t>(K_),
                     static_cast<uint16_t>(tileRows));
-                if constexpr (exportFinalKg) {
-                    // vTyped remains an input to the fused direct-V write. Produce finalKg only
-                    // after that call completes so its writeback cannot race the first V load.
-                    // The typed helper also keeps BF16 finalKg within the score-safe exp range.
-                    PipeBarrier<PIPE_V>();
-                    PrepareKdaGateKgRegbase<T, T, GK_T, true>(
-                        (__ubuf__ T *)reinterpret_cast<uint64_t>(vTyped.GetPhyAddr()),
-                        (__ubuf__ T *)reinterpret_cast<uint64_t>(kTyped.GetPhyAddr()),
-                        (__ubuf__ GK_T *)reinterpret_cast<uint64_t>(gateTyped.GetPhyAddr()),
-                        (__ubuf__ float *)reinterpret_cast<uint64_t>(finalRefFp32.GetPhyAddr()),
-                        static_cast<uint16_t>(tileRows), static_cast<uint16_t>(K_),
-                        static_cast<uint16_t>(tileRows));
-                }
             } else {
                 PrepareKdaGateQwRegbase<T, SCORE_T, GK_T, true>(
                     (__ubuf__ T *)reinterpret_cast<uint64_t>(qTyped.GetPhyAddr()),
@@ -3306,8 +3307,12 @@ private:
         PipeBarrier<PIPE_V>();
         Muls(xMat, akkMat, -1.0f, KDA_DIRECT_SCORE_MATRIX_ELEMENTS);
         PipeBarrier<PIPE_V>();
-        SolveDiagonalBlocksInRows(
-            akkMat, xMat, arena, 0, BT_, rowBegin, KDA_DIRECT_SCORE_ROWS);
+        // These independent 16x16 diagonal blocks share the 32-row UB result.
+        // Pair their VF work and finish the identity diagonal without a scalar round trip.
+        ForwardSubDiag16PairStridedRegbase(
+            (__ubuf__ float *)reinterpret_cast<uint64_t>(xMat.GetPhyAddr()),
+            static_cast<uint16_t>(BT_), static_cast<uint16_t>(rowBegin),
+            KDA_SOLVE_DIAG_BT, KDA_SOLVE_DIAG_BT);
 
         LocalTensor<T> aqkTyped = GateQTyped(0);
         Muls(aqkMat, aqkMat, scale_, KDA_DIRECT_SCORE_MATRIX_ELEMENTS);
@@ -3735,256 +3740,42 @@ private:
 
     __aicore__ inline void ComputeAkkMergeCubeWorkspaceArch35(uint64_t b, uint64_t hv, uint64_t chunkIdx)
     {
-        (void)b;
-        (void)hv;
-        SetMMLayoutTransform(true);
-
         using Element = float;
         using LayoutTag = Catlass::layout::RowMajor;
         using TileCopy = Catlass::Gemm::Tile::PackedTileCopyTla<KdaArchTag, Element, LayoutTag, Element,
                                                                 LayoutTag, Element, LayoutTag>;
-        using LayoutTagL1A = typename TileCopy::LayoutTagL1A;
-        using LayoutTagL1B = typename TileCopy::LayoutTagL1B;
-        using LayoutTagL0A = typename TileCopy::LayoutTagL0A;
-        using LayoutTagL0B = typename TileCopy::LayoutTagL0B;
-        using TileMmad = Catlass::Gemm::Tile::TileMmadTla<KdaArchTag, Element, LayoutTagL1A>;
-
-        constexpr uint32_t maxTile = 32;
-        constexpr uint32_t tileSlotBytes = maxTile * maxTile * sizeof(Element);
-        constexpr uint32_t a0Slot = 0;
-        constexpr uint32_t b0Slot = 1;
-        constexpr uint32_t a1Slot = 2;
-        constexpr uint32_t b1Slot = 3;
-        constexpr uint32_t diag0Slot = 4;
-        constexpr uint32_t diag1Slot = 5;
-        constexpr uint32_t tmp0Slot = 6;
-        constexpr uint32_t tmp1Slot = 7;
-
+        using BlockMmad = Catlass::Gemm::Block::BlockMmadTla<KdaSolveDispatchPolicy, KdaSolveL1TileShape,
+                                                              KdaSolveL0TileShape, Element, Element, Element,
+                                                              void, TileCopy>;
         Catlass::Arch::Resource<KdaArchTag> resource;
-        LocalTensor<Element> l1A0 = resource.l1Buf.template GetBufferByByte<Element>(a0Slot * tileSlotBytes);
-        LocalTensor<Element> l1B0 = resource.l1Buf.template GetBufferByByte<Element>(b0Slot * tileSlotBytes);
-        LocalTensor<Element> l1A1 = resource.l1Buf.template GetBufferByByte<Element>(a1Slot * tileSlotBytes);
-        LocalTensor<Element> l1B1 = resource.l1Buf.template GetBufferByByte<Element>(b1Slot * tileSlotBytes);
-        LocalTensor<Element> l1Diag0 =
-            resource.l1Buf.template GetBufferByByte<Element>(diag0Slot * tileSlotBytes);
-        LocalTensor<Element> l1Diag1 =
-            resource.l1Buf.template GetBufferByByte<Element>(diag1Slot * tileSlotBytes);
-        LocalTensor<Element> l1Tmp0 =
-            resource.l1Buf.template GetBufferByByte<Element>(tmp0Slot * tileSlotBytes);
-        LocalTensor<Element> l1Tmp1 =
-            resource.l1Buf.template GetBufferByByte<Element>(tmp1Slot * tileSlotBytes);
-
-        LocalTensor<Element> l0A0 = resource.l0ABuf.template GetBufferByByte<Element>(a0Slot * tileSlotBytes);
-        LocalTensor<Element> l0B0 = resource.l0BBuf.template GetBufferByByte<Element>(b0Slot * tileSlotBytes);
-        LocalTensor<Element> l0A1 = resource.l0ABuf.template GetBufferByByte<Element>(a1Slot * tileSlotBytes);
-        LocalTensor<Element> l0B1 = resource.l0BBuf.template GetBufferByByte<Element>(b1Slot * tileSlotBytes);
-        LocalTensor<Element> l0A2 =
-            resource.l0ABuf.template GetBufferByByte<Element>(diag0Slot * tileSlotBytes);
-        LocalTensor<Element> l0B2 =
-            resource.l0BBuf.template GetBufferByByte<Element>(diag0Slot * tileSlotBytes);
-        LocalTensor<Element> l0A3 =
-            resource.l0ABuf.template GetBufferByByte<Element>(diag1Slot * tileSlotBytes);
-        LocalTensor<Element> l0B3 =
-            resource.l0BBuf.template GetBufferByByte<Element>(diag1Slot * tileSlotBytes);
-        LocalTensor<Element> l0C0 = resource.l0CBuf.template GetBufferByByte<Element>(a0Slot * tileSlotBytes);
-        LocalTensor<Element> l0C1 = resource.l0CBuf.template GetBufferByByte<Element>(a1Slot * tileSlotBytes);
-        LocalTensor<Element> l0C2 =
-            resource.l0CBuf.template GetBufferByByte<Element>(diag0Slot * tileSlotBytes);
-        LocalTensor<Element> l0C3 =
-            resource.l0CBuf.template GetBufferByByte<Element>(diag1Slot * tileSlotBytes);
-
-        TileMmad tileMmad;
+        auto gmLayout = tla::MakeLayout<Element, LayoutTag>(BT_, BT_);
         const uint64_t xBase = SolveScratchOffset(b, hv, chunkIdx, KDA_SOLVE_SCRATCH_X);
         const uint64_t tmpBase = SolveScratchOffset(b, hv, chunkIdx, KDA_SOLVE_SCRATCH_TMP);
-        auto gmLayout = tla::MakeLayout<Element, LayoutTag>(BT_, BT_);
         auto tensorX = tla::MakeTensor(solveWorkspace_[xBase], gmLayout, Catlass::Arch::PositionGM{});
-        auto tensorTmp = tla::MakeTensor(solveWorkspace_[tmpBase], gmLayout, Catlass::Arch::PositionGM{});
+        // The largest temporary tile is 32x32; 512-byte rows fit in its existing 16 KiB plane.
+        auto tmpLayout = tla::MakeLayout<Element, LayoutTag>(BT_ / 2, BT_ * 2);
+        auto tensorTmp = tla::MakeTensor(solveWorkspace_[tmpBase], tmpLayout, Catlass::Arch::PositionGM{});
 
-        constexpr uint32_t tile16 = 16;
-        auto shape16 = tla::MakeShape(tile16, tile16);
-        auto blockA0 = GetTile(tensorX, tla::MakeCoord(16, 16), shape16);
-        auto blockB0 = GetTile(tensorX, tla::MakeCoord(16, 0), shape16);
-        auto blockA1 = GetTile(tensorX, tla::MakeCoord(48, 48), shape16);
-        auto blockB1 = GetTile(tensorX, tla::MakeCoord(48, 32), shape16);
-        auto blockDiag0 = GetTile(tensorX, tla::MakeCoord(0, 0), shape16);
-        auto blockDiag1 = GetTile(tensorX, tla::MakeCoord(32, 32), shape16);
-        auto blockTmp0 = GetTile(tensorTmp, tla::MakeCoord(0, 0), shape16);
-        auto blockTmp1 = GetTile(tensorTmp, tla::MakeCoord(16, 0), shape16);
-        auto blockOut0 = GetTile(tensorX, tla::MakeCoord(16, 0), shape16);
-        auto blockOut1 = GetTile(tensorX, tla::MakeCoord(48, 32), shape16);
-
-        using CopyGmToL1A16 = typename TileCopy::template CopyGmToL1A<decltype(blockA0)>;
-        using CopyGmToL1B16 = typename TileCopy::template CopyGmToL1B<decltype(blockB0)>;
-        using CopyL0CToDst16 = typename TileCopy::template CopyL0CToDst<decltype(blockTmp0)>;
-        CopyGmToL1A16 copyGmToL1A16;
-        CopyGmToL1B16 copyGmToL1B16;
-        CopyL0CToDst16 copyL0CToDst16;
-
-        auto tensorL1A0 = tla::MakeTensor(
-            l1A0, tla::MakeLayout<Element, LayoutTagL1A>(tile16, tile16), Catlass::Arch::PositionL1{});
-        auto tensorL1B0 = tla::MakeTensor(
-            l1B0, tla::MakeLayout<Element, LayoutTagL1B>(tile16, tile16), Catlass::Arch::PositionL1{});
-        auto tensorL1A1 = tla::MakeTensor(
-            l1A1, tla::MakeLayout<Element, LayoutTagL1A>(tile16, tile16), Catlass::Arch::PositionL1{});
-        auto tensorL1B1 = tla::MakeTensor(
-            l1B1, tla::MakeLayout<Element, LayoutTagL1B>(tile16, tile16), Catlass::Arch::PositionL1{});
-        auto tensorL1Diag0 = tla::MakeTensor(
-            l1Diag0, tla::MakeLayout<Element, LayoutTagL1B>(tile16, tile16), Catlass::Arch::PositionL1{});
-        auto tensorL1Diag1 = tla::MakeTensor(
-            l1Diag1, tla::MakeLayout<Element, LayoutTagL1B>(tile16, tile16), Catlass::Arch::PositionL1{});
-        auto tensorL1Tmp0 = tla::MakeTensor(
-            l1Tmp0, tla::MakeLayout<Element, LayoutTagL1A>(tile16, tile16), Catlass::Arch::PositionL1{});
-        auto tensorL1Tmp1 = tla::MakeTensor(
-            l1Tmp1, tla::MakeLayout<Element, LayoutTagL1A>(tile16, tile16), Catlass::Arch::PositionL1{});
-
-        auto tensorL0A0 = tla::MakeTensor(
-            l0A0, tla::MakeLayout<Element, LayoutTagL0A>(tile16, tile16), Catlass::Arch::PositionL0A{});
-        auto tensorL0B0 = tla::MakeTensor(
-            l0B0, tla::MakeLayout<Element, LayoutTagL0B>(tile16, tile16), Catlass::Arch::PositionL0B{});
-        auto tensorL0A1 = tla::MakeTensor(
-            l0A1, tla::MakeLayout<Element, LayoutTagL0A>(tile16, tile16), Catlass::Arch::PositionL0A{});
-        auto tensorL0B1 = tla::MakeTensor(
-            l0B1, tla::MakeLayout<Element, LayoutTagL0B>(tile16, tile16), Catlass::Arch::PositionL0B{});
-        auto tensorL0A2 = tla::MakeTensor(
-            l0A2, tla::MakeLayout<Element, LayoutTagL0A>(tile16, tile16), Catlass::Arch::PositionL0A{});
-        auto tensorL0B2 = tla::MakeTensor(
-            l0B2, tla::MakeLayout<Element, LayoutTagL0B>(tile16, tile16), Catlass::Arch::PositionL0B{});
-        auto tensorL0A3 = tla::MakeTensor(
-            l0A3, tla::MakeLayout<Element, LayoutTagL0A>(tile16, tile16), Catlass::Arch::PositionL0A{});
-        auto tensorL0B3 = tla::MakeTensor(
-            l0B3, tla::MakeLayout<Element, LayoutTagL0B>(tile16, tile16), Catlass::Arch::PositionL0B{});
-        auto tensorL0C0 = tla::MakeTensor(l0C0, tla::MakeLayoutL0C(tile16, tile16), Catlass::Arch::PositionL0C{});
-        auto tensorL0C1 = tla::MakeTensor(l0C1, tla::MakeLayoutL0C(tile16, tile16), Catlass::Arch::PositionL0C{});
-        auto tensorL0C2 = tla::MakeTensor(l0C2, tla::MakeLayoutL0C(tile16, tile16), Catlass::Arch::PositionL0C{});
-        auto tensorL0C3 = tla::MakeTensor(l0C3, tla::MakeLayoutL0C(tile16, tile16), Catlass::Arch::PositionL0C{});
-        uint32_t localRow16 = 0;
-        uint32_t localColumn16 = 0;
-        auto tileL0A0 = GetTile(tensorL0A0, tla::MakeCoord(localRow16, localColumn16), shape16);
-        auto tileL0B0 = GetTile(tensorL0B0, tla::MakeCoord(localRow16, localColumn16), shape16);
-        auto tileL0A1 = GetTile(tensorL0A1, tla::MakeCoord(localRow16, localColumn16), shape16);
-        auto tileL0B1 = GetTile(tensorL0B1, tla::MakeCoord(localRow16, localColumn16), shape16);
-        auto tileL0A2 = GetTile(tensorL0A2, tla::MakeCoord(localRow16, localColumn16), shape16);
-        auto tileL0B2 = GetTile(tensorL0B2, tla::MakeCoord(localRow16, localColumn16), shape16);
-        auto tileL0A3 = GetTile(tensorL0A3, tla::MakeCoord(localRow16, localColumn16), shape16);
-        auto tileL0B3 = GetTile(tensorL0B3, tla::MakeCoord(localRow16, localColumn16), shape16);
-        auto tileL0C0 = GetTile(tensorL0C0, tla::MakeCoord(localRow16, localColumn16), shape16);
-        auto tileL0C1 = GetTile(tensorL0C1, tla::MakeCoord(localRow16, localColumn16), shape16);
-        auto tileL0C2 = GetTile(tensorL0C2, tla::MakeCoord(localRow16, localColumn16), shape16);
-        auto tileL0C3 = GetTile(tensorL0C3, tla::MakeCoord(localRow16, localColumn16), shape16);
-
-        copyGmToL1A16(tensorL1A0, blockA0);
-        copyGmToL1B16(tensorL1B0, blockB0);
-        copyGmToL1A16(tensorL1A1, blockA1);
-        copyGmToL1B16(tensorL1B1, blockB1);
-        copyGmToL1B16(tensorL1Diag0, blockDiag0);
-        copyGmToL1B16(tensorL1Diag1, blockDiag1);
-        SetFlag<HardEvent::MTE2_MTE1>(0);
-        WaitFlag<HardEvent::MTE2_MTE1>(0);
-
-        LoadSolveTile<tile16, false>(l0A0, l1A0);
-        LoadSolveTile<tile16, true>(l0B0, l1B0);
-        LoadSolveTile<tile16, false>(l0A1, l1A1);
-        LoadSolveTile<tile16, true>(l0B1, l1B1);
-        SetFlag<HardEvent::MTE1_M>(0);
-        WaitFlag<HardEvent::MTE1_M>(0);
-        tileMmad(tileL0C0, tileL0A0, tileL0B0, tile16, tile16, tile16, true, 0b11);
-        SetFlag<HardEvent::M_FIX>(0);
-        tileMmad(tileL0C1, tileL0A1, tileL0B1, tile16, tile16, tile16, true, 0b11);
-        SetFlag<HardEvent::M_FIX>(1);
-        WaitFlag<HardEvent::M_FIX>(0);
-        copyL0CToDst16(blockTmp0, tileL0C0, 0b11);
-        SetFlag<HardEvent::FIX_MTE2>(0);
-        WaitFlag<HardEvent::M_FIX>(1);
-        copyL0CToDst16(blockTmp1, tileL0C1, 0b11);
-        SetFlag<HardEvent::FIX_MTE2>(1);
-        WaitFlag<HardEvent::FIX_MTE2>(0);
-        copyGmToL1A16(tensorL1Tmp0, blockTmp0);
-        WaitFlag<HardEvent::FIX_MTE2>(1);
-        copyGmToL1A16(tensorL1Tmp1, blockTmp1);
-        SetFlag<HardEvent::MTE2_MTE1>(0);
-        WaitFlag<HardEvent::MTE2_MTE1>(0);
-
-        LoadSolveTile<tile16, false>(l0A2, l1Tmp0);
-        LoadSolveTile<tile16, true>(l0B2, l1Diag0);
-        LoadSolveTile<tile16, false>(l0A3, l1Tmp1);
-        LoadSolveTile<tile16, true>(l0B3, l1Diag1);
-        SetFlag<HardEvent::MTE1_M>(0);
-        WaitFlag<HardEvent::MTE1_M>(0);
-        tileMmad(tileL0C2, tileL0A2, tileL0B2, tile16, tile16, tile16, true, 0b11);
-        SetFlag<HardEvent::M_FIX>(2);
-        tileMmad(tileL0C3, tileL0A3, tileL0B3, tile16, tile16, tile16, true, 0b11);
-        SetFlag<HardEvent::M_FIX>(3);
-        WaitFlag<HardEvent::M_FIX>(2);
-        copyL0CToDst16(blockOut0, tileL0C2, 0b11);
-        SetFlag<HardEvent::FIX_MTE2>(2);
-        WaitFlag<HardEvent::M_FIX>(3);
-        copyL0CToDst16(blockOut1, tileL0C3, 0b11);
-        SetFlag<HardEvent::FIX_MTE2>(3);
-
-        constexpr uint32_t tile32 = 32;
-        auto shape32 = tla::MakeShape(tile32, tile32);
-        auto blockA32 = GetTile(tensorX, tla::MakeCoord(32, 32), shape32);
-        auto blockB32 = GetTile(tensorX, tla::MakeCoord(32, 0), shape32);
-        auto blockDiag32 = GetTile(tensorX, tla::MakeCoord(0, 0), shape32);
-        auto blockTmp32 = GetTile(tensorTmp, tla::MakeCoord(0, 0), shape32);
-        auto blockOut32 = GetTile(tensorX, tla::MakeCoord(32, 0), shape32);
-        using CopyGmToL1A32 = typename TileCopy::template CopyGmToL1A<decltype(blockA32)>;
-        using CopyGmToL1B32 = typename TileCopy::template CopyGmToL1B<decltype(blockB32)>;
-        using CopyL0CToDst32 = typename TileCopy::template CopyL0CToDst<decltype(blockTmp32)>;
-        CopyGmToL1A32 copyGmToL1A32;
-        CopyGmToL1B32 copyGmToL1B32;
-        CopyL0CToDst32 copyL0CToDst32;
-
-        auto tensorL1A32 = tla::MakeTensor(
-            l1A0, tla::MakeLayout<Element, LayoutTagL1A>(tile32, tile32), Catlass::Arch::PositionL1{});
-        auto tensorL1B32 = tla::MakeTensor(
-            l1B0, tla::MakeLayout<Element, LayoutTagL1B>(tile32, tile32), Catlass::Arch::PositionL1{});
-        auto tensorL1Diag32 = tla::MakeTensor(
-            l1Diag0, tla::MakeLayout<Element, LayoutTagL1B>(tile32, tile32), Catlass::Arch::PositionL1{});
-        auto tensorL1Tmp32 = tla::MakeTensor(
-            l1Tmp0, tla::MakeLayout<Element, LayoutTagL1A>(tile32, tile32), Catlass::Arch::PositionL1{});
-        auto tensorL0A32 = tla::MakeTensor(
-            l0A0, tla::MakeLayout<Element, LayoutTagL0A>(tile32, tile32), Catlass::Arch::PositionL0A{});
-        auto tensorL0B32 = tla::MakeTensor(
-            l0B0, tla::MakeLayout<Element, LayoutTagL0B>(tile32, tile32), Catlass::Arch::PositionL0B{});
-        auto tensorL0C32 = tla::MakeTensor(l0C0, tla::MakeLayoutL0C(tile32, tile32), Catlass::Arch::PositionL0C{});
-        uint32_t localRow32 = 0;
-        uint32_t localColumn32 = 0;
-        auto tileL0A32 = GetTile(tensorL0A32, tla::MakeCoord(localRow32, localColumn32), shape32);
-        auto tileL0B32 = GetTile(tensorL0B32, tla::MakeCoord(localRow32, localColumn32), shape32);
-        auto tileL0C32 = GetTile(tensorL0C32, tla::MakeCoord(localRow32, localColumn32), shape32);
-
-        WaitFlag<HardEvent::FIX_MTE2>(2);
-        WaitFlag<HardEvent::FIX_MTE2>(3);
-        copyGmToL1A32(tensorL1A32, blockA32);
-        copyGmToL1B32(tensorL1B32, blockB32);
-        copyGmToL1B32(tensorL1Diag32, blockDiag32);
-        SetFlag<HardEvent::MTE2_MTE1>(0);
-        WaitFlag<HardEvent::MTE2_MTE1>(0);
-        LoadSolveTile<tile32, false>(l0A0, l1A0);
-        LoadSolveTile<tile32, true>(l0B0, l1B0);
-        SetFlag<HardEvent::MTE1_M>(0);
-        WaitFlag<HardEvent::MTE1_M>(0);
-        tileMmad(tileL0C32, tileL0A32, tileL0B32, tile32, tile32, tile32, true, 0b11);
-        SetFlag<HardEvent::M_FIX>(0);
-        WaitFlag<HardEvent::M_FIX>(0);
-        copyL0CToDst32(blockTmp32, tileL0C32, 0b11);
-        SetFlag<HardEvent::FIX_MTE2>(0);
-        WaitFlag<HardEvent::FIX_MTE2>(0);
-        copyGmToL1A32(tensorL1Tmp32, blockTmp32);
-        SetFlag<HardEvent::MTE2_MTE1>(0);
-        WaitFlag<HardEvent::MTE2_MTE1>(0);
-        LoadSolveTile<tile32, false>(l0A0, l1Tmp0);
-        LoadSolveTile<tile32, true>(l0B0, l1Diag0);
-        SetFlag<HardEvent::MTE1_M>(0);
-        WaitFlag<HardEvent::MTE1_M>(0);
-        tileMmad(tileL0C32, tileL0A32, tileL0B32, tile32, tile32, tile32, true, 0b11);
-        SetFlag<HardEvent::M_FIX>(0);
-        WaitFlag<HardEvent::M_FIX>(0);
-        copyL0CToDst32(blockOut32, tileL0C32, 0b11);
-        SetFlag<HardEvent::FIX_MTE2>(0);
-        WaitFlag<HardEvent::FIX_MTE2>(0);
-        SetMMLayoutTransform(false);
+        // Keep Catlass stage ownership across the six dependent FP32 GEMMs.
+        BlockMmad blockMmad(resource);
+        for (uint32_t mergeSize = 2 * KDA_SOLVE_DIAG_BT; mergeSize <= BT_; mergeSize *= 2) {
+            const uint32_t half = mergeSize / 2;
+            const Catlass::GemmCoord shape{half, half, half};
+            const auto tileShape = tla::MakeShape(half, half);
+            for (uint32_t block = 0; block < BT_; block += mergeSize) {
+                const uint32_t lower = block + half;
+                auto diagLower = GetTile(tensorX, tla::MakeCoord(lower, lower), tileShape);
+                auto offDiagonal = GetTile(tensorX, tla::MakeCoord(lower, block), tileShape);
+                auto diagUpper = GetTile(tensorX, tla::MakeCoord(block, block), tileShape);
+                auto tmp = GetTile(tensorTmp, tla::MakeCoord(uint32_t{0}, uint32_t{0}), tileShape);
+                blockMmad(diagLower, offDiagonal, tmp, shape);
+                SetFlag<HardEvent::FIX_MTE2>(KDA_ARCH35_SOLVE_FIX_EVENT);
+                WaitFlag<HardEvent::FIX_MTE2>(KDA_ARCH35_SOLVE_FIX_EVENT);
+                blockMmad(tmp, diagUpper, offDiagonal, shape);
+                SetFlag<HardEvent::FIX_MTE2>(KDA_ARCH35_SOLVE_FIX_EVENT);
+                WaitFlag<HardEvent::FIX_MTE2>(KDA_ARCH35_SOLVE_FIX_EVENT);
+            }
+        }
     }
 #endif
 
@@ -3992,7 +3783,7 @@ private:
     {
 #if defined(__CCE_AICORE__) && __CCE_AICORE__ == 310
         if constexpr (SAFE_GATE && COMPILE_BT == 64 && COMPILE_K == 128 && COMPILE_V == 128) {
-            ComputeAkkMergeCubeWorkspace(b, hv, chunkIdx);
+            ComputeAkkMergeCubeWorkspaceArch35(b, hv, chunkIdx);
             return;
         }
 #endif
@@ -4388,7 +4179,9 @@ private:
                   KDA_SCORE_QUEUE_DEPTH;
         const bool useDirectScoreUb =
 #if defined(__CCE_AICORE__) && __CCE_AICORE__ == 310
-            KDA_ARCH35_ENABLE_DIRECT_SCORE_UB && pairHeads && curT == 64 && scoreBlockCount == 2;
+            KDA_ARCH35_ENABLE_DIRECT_SCORE_UB &&
+            SAFE_GATE && COMPILE_BT == 64 && COMPILE_K == 128 && COMPILE_V == 128 &&
+            pairHeads && curT == 64 && scoreBlockCount == 2;
 #else
             false;
 #endif
@@ -4639,7 +4432,7 @@ private:
                     : block % KDA_SCORE_QUEUE_DEPTH;
 #if defined(__CCE_AICORE__) && __CCE_AICORE__ == 310
                 bool directScoreDispatched = false;
-                if constexpr (SAFE_GATE) {
+                if constexpr (SAFE_GATE && COMPILE_BT == 64 && COMPILE_K == 128 && COMPILE_V == 128) {
                     if (KDA_ARCH35_ENABLE_DIRECT_SCORE_UB && curT == 64 && rowCount == 32) {
                         uint64_t scoreSlotBase = ScoreScratchSlot(queueSlot, 0, true);
                         if (rowBegin == 0) {
@@ -5066,6 +4859,8 @@ private:
     bool headPairMode_ = false;
     bool inputSequenceMajor_ = false;
     bool fusePostWu_ = false;
+    bool fusePostWuIntoFwdH_ = false;
+    bool storeGk_ = false;
     bool computeGateInPrepare_ = false;
     bool hasALog_ = false;
     bool hasDtBias_ = false;

@@ -91,12 +91,15 @@ public:
     using CubeScheduler = typename Catlass::Gemm::Block::BlockSchedulerGdnFwdHCube;
     using VecScheduler = typename Catlass::Gemm::Block::BlockSchedulerGdnFwdHVec;
 
-    using DispatchPolicyTlaMulti = Gemm::MmadPingpongTlaMulti<ArchTag, false, false, 2>;
-    using DispatchPolicyTlaTail = Gemm::MmadPingpongTlaMulti<ArchTag, true, false, 1>;
-    using DispatchPolicyDirectUb = Common::MmadPingpong<ArchTag, false, false, 2>;
-    using DispatchPolicyTlaPreloadAL1B = Gemm::MmadPingpongTlaPreloadAL1B<ArchTag, true>;
     using L1TileShapeVTla = typename TileShapes::L1TileShape;
     using L0TileShapeVTla = typename TileShapes::L0TileShape;
+    static constexpr uint32_t L0C_TILE_BYTES =
+        tla::get<0>(L0TileShapeVTla{}) * tla::get<1>(L0TileShapeVTla{}) * sizeof(float);
+    static constexpr uint32_t L0C_STAGES = 2 * L0C_TILE_BYTES <= ArchTag::L0C_SIZE ? 2 : 1;
+    using DispatchPolicyTlaMulti = Gemm::MmadPingpongTlaMulti<ArchTag, false, false, L0C_STAGES>;
+    using DispatchPolicyTlaTail = Gemm::MmadPingpongTlaMulti<ArchTag, true, false, 1>;
+    using DispatchPolicyDirectUb = Common::MmadPingpong<ArchTag, false, false, L0C_STAGES>;
+    using DispatchPolicyTlaPreloadAL1B = Gemm::MmadPingpongTlaPreloadAL1B<ArchTag, true>;
 
     using WType = Gemm::GemmType<INPUT_TYPE, layout::RowMajor>;
     using HType = Gemm::GemmType<INPUT_TYPE, layout::RowMajor>;

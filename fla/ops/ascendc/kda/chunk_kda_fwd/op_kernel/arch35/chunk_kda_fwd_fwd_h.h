@@ -16,14 +16,14 @@ using namespace AscendC;
 constexpr uint64_t KDA_FWD_H_DIRECT_FREE_FLAG = 6;
 constexpr uint64_t KDA_FWD_H_DIRECT_READY_FLAG = 7;
 constexpr uint64_t KDA_FWD_H_SUBBLOCK_FLAG_OFFSET = 16;
-// Prepare is fully drained before FwdH starts. Keep FwdH mode-2 L1
-// traffic outside Matmul's possible 0..7 range and SyncAll's 11..14 range.
-constexpr uint64_t KDA_FWD_H_L1_FREE_FLAG = 9;
-constexpr uint64_t KDA_FWD_H_L1_READY_FLAG = 9;
+// Prepare leaves mode-4 FREE tokens on 8/9. Keep L1 handoff flags
+// 4/5 (+16 for AIV1) separate from Prepare 8..11 and direct UB 6/7.
+constexpr uint64_t KDA_FWD_H_L1_FREE_FLAG = 4;
+constexpr uint64_t KDA_FWD_H_L1_READY_FLAG = 4;
 constexpr uint64_t KDA_FWD_H_STATE_FREE_FLAG = KDA_FWD_H_L1_FREE_FLAG;
 constexpr uint64_t KDA_FWD_H_STATE_READY_FLAG = KDA_FWD_H_L1_READY_FLAG;
-constexpr uint64_t KDA_FWD_H_VNEW_FREE_FLAG = 10;
-constexpr uint64_t KDA_FWD_H_VNEW_READY_FLAG = 10;
+constexpr uint64_t KDA_FWD_H_VNEW_FREE_FLAG = 5;
+constexpr uint64_t KDA_FWD_H_VNEW_READY_FLAG = 5;
 
 constexpr TEventID KDA_FWD_H_MTE_W_EVENT = 0;
 constexpr TEventID KDA_FWD_H_MTE_Q_EVENT = 1;
@@ -146,25 +146,28 @@ private:
         uint64_t freeFlag, uint32_t publishCount)
     {
         if (publishCount != 0) {
-            CrossCoreWaitFlag(freeFlag);
+            CrossCoreWaitFlag<0x4, PIPE_S>(freeFlag);
         }
     }
 
     template <pipe_t PIPE>
     __aicore__ inline void SetL1SlotFlagAicToAiv(uint64_t flag)
     {
-        CrossCoreSetFlag<0x2, PIPE>(flag);
+        CrossCoreSetFlag<0x4, PIPE>(flag);
+        CrossCoreSetFlag<0x4, PIPE>(flag + KDA_FWD_H_SUBBLOCK_FLAG_OFFSET);
     }
 
     template <pipe_t PIPE>
     __aicore__ inline void SetL1SlotFlagAivToAic(uint64_t flag)
     {
-        CrossCoreSetFlag<0x2, PIPE>(flag);
+        CrossCoreSetFlag<0x4, PIPE>(flag);
     }
 
     __aicore__ inline void WaitL1SlotReadyMte1(uint64_t readyFlag)
     {
-        CrossCoreWaitFlag(readyFlag);
+        // L1 loads consume the publication; allow Scalar to keep dispatching.
+        CrossCoreWaitFlag<0x4, PIPE_MTE1>(readyFlag);
+        CrossCoreWaitFlag<0x4, PIPE_MTE1>(readyFlag + KDA_FWD_H_SUBBLOCK_FLAG_OFFSET);
     }
 
     __aicore__ inline void WaitDirectFreeAic()
@@ -726,6 +729,33 @@ private:
         DataCopyPad(attnOut_[OutputOffset(b, hv, tokenStart)], src, params);
     }
 
+    // Round a 32x128 fp32 sub-chunk tile into the bf16 L1 operand layout:
+    // 16-column fractals with the rows contiguous inside each fractal. A single
+    // DataCopy can then place the whole tile (see CopyOperandTileToL1).
+    __aicore__ inline void CastToL1OperandLayout(LocalTensor<T> dst, LocalTensor<float> src)
+    {
+        constexpr uint32_t columnGroup = 64;
+        constexpr uint32_t columnGroups = KDA_FWD_H_DIM / columnGroup;
+        for (uint32_t group = 0; group < columnGroups; ++group) {
+            Cast(dst[group * KDA_FWD_H_SUB_CHUNK * columnGroup],
+                 src[group * columnGroup], RoundMode::CAST_RINT,
+                 columnGroup, KDA_FWD_H_SUB_CHUNK,
+                 {static_cast<uint16_t>(KDA_FWD_H_SUB_CHUNK), 1, 1,
+                  static_cast<uint8_t>(columnGroups * 8)});
+        }
+    }
+
+    // One DataCopy per AIV for a sub-chunk tile already in operand layout.
+    __aicore__ inline void CopyOperandTileToL1(LocalTensor<T> dst, LocalTensor<T> src)
+    {
+        DataCopyParams params;
+        params.blockCount = KDA_FWD_H_DIM / 16;
+        params.blockLen = KDA_FWD_H_SUB_CHUNK;
+        params.srcGap = 0;
+        params.dstGap = KDA_FWD_H_CHUNK - KDA_FWD_H_SUB_CHUNK;
+        DataCopy(dst, src, params);
+    }
+
     __aicore__ inline void InitializeStateAiv(
         uint64_t b, uint64_t hv, uint32_t rowBegin,
         LocalTensor<float> state)
@@ -801,7 +831,9 @@ private:
         WaitDirectReadyAiv();
         WaitFlag<HardEvent::MTE3_MTE2>(aivMte3ToMte2Event_);
         if (fusePostWuIntoFwdH_) {
-            Cast(ioTyped, direct, RoundMode::CAST_RINT, KDA_FWD_H_TOKEN_SUB_ELEMS);
+            // Prepare W directly in the L1 operand layout so one DataCopy
+            // publishes it instead of eight 16-column gathers.
+            CastToL1OperandLayout(ioTyped, direct);
             PipeBarrier<PIPE_V>();
             SetDirectFreeAiv();
 
@@ -809,16 +841,7 @@ private:
             WaitFlag<HardEvent::V_MTE3>(aivVToMte3Event_);
             LocalTensor<T> l1W = resource_.l1Buf.template GetBufferByByte<T>(
                 L1WOffset(chunk & 3));
-            DataCopyParams wCopyParams;
-            wCopyParams.blockCount = KDA_FWD_H_SUB_CHUNK;
-            wCopyParams.blockLen = 1;
-            wCopyParams.srcGap = KDA_FWD_H_DIM / 16 - 1;
-            wCopyParams.dstGap = 0;
-            for (uint32_t colBlock = 0; colBlock < KDA_FWD_H_DIM / 16; ++colBlock) {
-                const uint32_t dstOffset =
-                    colBlock * KDA_FWD_H_CHUNK * 16 + tokenBegin * 16;
-                DataCopy(l1W[dstOffset], ioTyped[colBlock * 16], wCopyParams);
-            }
+            CopyOperandTileToL1(l1W[tokenBegin * 16], ioTyped);
             SetFlag<HardEvent::MTE3_V>(aivMte3ToVEvent_);
             WaitFlag<HardEvent::MTE3_V>(aivMte3ToVEvent_);
             SetL1SlotFlagAivToAic<PIPE_MTE3>(KDA_FWD_H_STATE_READY_FLAG);
@@ -852,15 +875,7 @@ private:
             WaitFlag<HardEvent::MTE3_V>(aivMte3ToVEvent_);
         }
 
-        constexpr uint32_t columnGroup = 64;
-        constexpr uint32_t columnGroups = KDA_FWD_H_DIM / columnGroup;
-        for (uint32_t group = 0; group < columnGroups; ++group) {
-            Cast(ioTyped[group * KDA_FWD_H_SUB_CHUNK * columnGroup],
-                 vnew[group * columnGroup], RoundMode::CAST_RINT,
-                 columnGroup, KDA_FWD_H_SUB_CHUNK,
-                 {static_cast<uint16_t>(KDA_FWD_H_SUB_CHUNK), 1, 1,
-                  static_cast<uint8_t>(columnGroups * 8)});
-        }
+        CastToL1OperandLayout(ioTyped, vnew);
         PipeBarrier<PIPE_V>();
         SetFlag<HardEvent::V_MTE3>(aivVToMte3Event_);
         WaitFlag<HardEvent::V_MTE3>(aivVToMte3Event_);
@@ -868,12 +883,7 @@ private:
             resource_.l1Buf.template GetBufferByByte<T>(KDA_FWD_H_L1_V_OFFSET);
         WaitL1SlotFreeMte3(
             KDA_FWD_H_VNEW_FREE_FLAG, vnewPublishCount_[subBlockIdx]);
-        DataCopyParams vnewL1CopyParams;
-        vnewL1CopyParams.blockCount = KDA_FWD_H_DIM / 16;
-        vnewL1CopyParams.blockLen = KDA_FWD_H_SUB_CHUNK;
-        vnewL1CopyParams.srcGap = 0;
-        vnewL1CopyParams.dstGap = KDA_FWD_H_CHUNK - KDA_FWD_H_SUB_CHUNK;
-        DataCopy(l1Vnew[tokenBegin * 16], ioTyped, vnewL1CopyParams);
+        CopyOperandTileToL1(l1Vnew[tokenBegin * 16], ioTyped);
         SetFlag<HardEvent::MTE3_V>(aivMte3ToVEvent_);
         WaitFlag<HardEvent::MTE3_V>(aivMte3ToVEvent_);
         SetL1SlotFlagAivToAic<PIPE_MTE3>(KDA_FWD_H_VNEW_READY_FLAG);
@@ -962,6 +972,8 @@ private:
                 WaitFlag<HardEvent::MTE3_V>(aivMte3ToVEvent_);
             }
         }
+        WaitL1SlotFreeMte3(KDA_FWD_H_STATE_FREE_FLAG, statePublishCount_[subBlockIdx]);
+        WaitL1SlotFreeMte3(KDA_FWD_H_VNEW_FREE_FLAG, vnewPublishCount_[subBlockIdx]);
         WaitFlag<HardEvent::MTE3_MTE2>(aivMte3ToMte2Event_);
     }
 

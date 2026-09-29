@@ -577,6 +577,18 @@ aclnnStatus aclnnChunkKdaFwdGetWorkspaceSize(
     CHECK_RET(CheckParams(params, parsedLayout, info) == ACLNN_SUCCESS, ACLNN_ERR_PARAM_INVALID);
     CHECK_RET(ContiguousInputs(params, executorPtr) == ACLNN_SUCCESS, ACLNN_ERR_PARAM_INVALID);
 
+    // A single packed sequence with full chunks has the same chunk/state
+    // indexing as dense B=1 metadata. Treat it as dense internally so A5 can
+    // use the fused single-launch path while preserving the public varlen API.
+    const bool denseEquivalent =
+        params.cuSeqlensOptional != nullptr && info.batch == 1 && info.seqNum == 1 &&
+        info.seqlen % params.chunkSize == 0 && params.q->GetDataType() == DataType::DT_BF16 &&
+        params.chunkSize == 64 && info.kDim == 128 && info.vDim == 128;
+    const aclIntArray *launchCuSeqlens =
+        denseEquivalent ? nullptr : params.cuSeqlensOptional;
+    const aclIntArray *launchChunkIndices =
+        denseEquivalent ? nullptr : params.chunkIndicesOptional;
+
     const aclTensor *qHead = params.q;
     const aclTensor *kHead = params.k;
     const aclTensor *vHead = params.v;
@@ -623,7 +635,7 @@ aclnnStatus aclnnChunkKdaFwdGetWorkspaceSize(
         MakeShape({info.seqNum, info.hvNum, info.kDim, info.vDim});
     const op::Shape placeholderShape = MakeShape({1});
     const bool useDenseA5FastPath =
-        params.cuSeqlensOptional == nullptr && params.q->GetDataType() == DataType::DT_BF16 &&
+        launchCuSeqlens == nullptr && params.q->GetDataType() == DataType::DT_BF16 &&
         params.chunkSize == 64 && info.kDim == 128 && info.vDim == 128 &&
         info.seqlen % params.chunkSize == 0;
     const bool splitStages =
@@ -731,8 +743,8 @@ aclnnStatus aclnnChunkKdaFwdGetWorkspaceSize(
     auto launchStage = [&](int64_t stage) {
         return l0op::KdaChunkForward(
             qHead, kHead, vHead, gHead, betaHead, params.aLogOptional,
-            params.dtBiasOptional, initialStateCompute, params.cuSeqlensOptional,
-            params.chunkIndicesOptional, params.scale, params.chunkSize,
+            params.dtBiasOptional, initialStateCompute, launchCuSeqlens,
+            launchChunkIndices, params.scale, params.chunkSize,
             params.safeGate, parsedLayout == KdaFwdLayout::BSND,
             params.useGateInKernel, params.lowerBound, attnCompute,
             finalStateCompute, gkCompute, aqkCompute, akkCompute, wCompute,

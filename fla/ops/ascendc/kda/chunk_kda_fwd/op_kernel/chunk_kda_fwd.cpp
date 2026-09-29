@@ -2,6 +2,9 @@
 #include "lib/matmul_intf.h"
 
 #include "chunk_kda_fwd_common.h"
+#if defined(__CCE_AICORE__) && __CCE_AICORE__ == 310
+#include "arch35/chunk_kda_fwd_precise_state.h"
+#endif
 #if defined(__CCE_AICORE__) && __CCE_AICORE__ == 310 && \
     (!defined(TILING_KEY_VAR) || TILING_KEY_VAR == 2UL)
 #define KDA_COMPILE_ARCH35_FAST_PATH 1
@@ -53,7 +56,11 @@ __aicore__ inline void DispatchStage(
             addresses.u, addresses.kg, addresses.vNew, userWorkspace,
             tiling, pipe);
     } else if (tiling.stage == KDA_STAGE_FWD_H) {
-        if (tiling.vHeadDim > 128) {
+        if (tiling.kHeadDim > 128) {
+            RunFwdH<T, KdaFwdHTileShapesK256>(
+                initialState, cuSeqlens, chunkIndices, addresses,
+                userWorkspace, tiling);
+        } else if (tiling.vHeadDim > 128) {
             RunFwdH<T, Catlass::Gemm::Kernel::GDNFwdHTileShapes256>(
                 initialState, cuSeqlens, chunkIndices, addresses,
                 userWorkspace, tiling);
@@ -180,6 +187,25 @@ __aicore__ inline void DispatchGenericSafeGate(
     }
 }
 
+template <typename T, typename BetaT, typename TilingData>
+__aicore__ inline void FinalizePreciseState(
+    GM_ADDR k, GM_ADDR v, GM_ADDR beta, GM_ADDR initial, GM_ADDR cuSeqlens,
+    GM_ADDR finalState, GM_ADDR gk, GM_ADDR w, GM_ADDR u, GM_ADDR qg,
+    GM_ADDR kg, GM_ADDR vNew, GM_ADDR h, GM_ADDR workspace, const TilingData &tiling)
+{
+#if defined(__CCE_AICORE__) && __CCE_AICORE__ == 310
+    if (!tiling.storeFinalState ||
+        (tiling.stage != KDA_STAGE_FULL && tiling.stage != KDA_STAGE_FINALIZE)) {
+        return;
+    }
+    SyncAll<false>();
+    const auto addresses = ResolveAddresses(
+        finalState, gk, w, u, qg, kg, vNew, h, workspace, tiling);
+    KdaPreciseState::Run<T, BetaT>(
+        k, v, beta, initial, cuSeqlens, addresses.gk, addresses.finalState, tiling);
+#endif
+}
+
 } // namespace KdaForward
 
 extern "C" __global__ __aicore__ void chunk_kda_fwd(
@@ -203,6 +229,9 @@ extern "C" __global__ __aicore__ void chunk_kda_fwd(
                 chunk_indices, attn_out, final_state, gk, aqk, akk, w, u,
                 qg, kg, v_new, h, qg_scaled, u_seed, userWorkspace,
                 tilingData);
+            KdaForward::FinalizePreciseState<DTYPE_Q, DTYPE_BETA>(
+            k, v, beta, initial_state, cu_seqlens, final_state, gk,
+            w, u, qg, kg, v_new, h, userWorkspace, tilingData);
             return;
         }
         KdaForward::DispatchGenericSafeGate<DTYPE_Q, DTYPE_BETA,
@@ -218,6 +247,9 @@ extern "C" __global__ __aicore__ void chunk_kda_fwd(
                 chunk_indices, attn_out, final_state, gk, aqk, akk, w, u,
                 qg, kg, v_new, h, qg_scaled, u_seed, userWorkspace,
                 tilingData);
+            KdaForward::FinalizePreciseState<DTYPE_Q, DTYPE_BETA>(
+            k, v, beta, initial_state, cu_seqlens, final_state, gk,
+            w, u, qg, kg, v_new, h, userWorkspace, tilingData);
             return;
         }
 #if defined(__CCE_AICORE__) && __CCE_AICORE__ == 310
@@ -231,6 +263,9 @@ extern "C" __global__ __aicore__ void chunk_kda_fwd(
             chunk_indices, attn_out, final_state, gk, aqk, akk, w, u, qg,
             kg, v_new, h, userWorkspace, tilingData);
     }
+        KdaForward::FinalizePreciseState<DTYPE_Q, DTYPE_BETA>(
+            k, v, beta, initial_state, cu_seqlens, final_state, gk,
+            w, u, qg, kg, v_new, h, userWorkspace, tilingData);
 }
 
 #undef KDA_COMPILE_ARCH35_FAST_PATH
