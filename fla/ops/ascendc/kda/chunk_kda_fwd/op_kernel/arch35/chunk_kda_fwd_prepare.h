@@ -3337,6 +3337,62 @@ private:
     }
 #endif
 
+    // FP16 score factors cannot be rounded through BF16: its mantissa is
+    // too short for the FP16 comparison threshold. Form causal scores from
+    // original inputs in FP32, using the gate difference before exponentiation.
+    __aicore__ inline void RecomputeFp16CausalScores(
+        uint64_t b, uint64_t hv, uint64_t start, uint64_t curT,
+        uint64_t rowBegin, uint64_t rowCount, LocalTensor<float> aqkMat,
+        LocalTensor<float> akkMat, LocalTensor<float> scratch)
+    {
+        LocalTensor<float> qRow = scratch;
+        LocalTensor<float> kRow = scratch[K_];
+        LocalTensor<float> gRow = scratch[2 * K_];
+        LocalTensor<float> kCol = scratch[3 * K_];
+        LocalTensor<float> gCol = scratch[4 * K_];
+        LocalTensor<float> decay = scratch[5 * K_];
+        LocalTensor<float> product = scratch[6 * K_];
+        LocalTensor<float> reduced = scratch[7 * K_];
+        LocalTensor<float> reduceTmp = scratch[8 * K_];
+        const uint64_t head = hv / (HV_ / H_);
+        FillLocalFloat(aqkMat, 0.0f, rowCount * BT_);
+        FillLocalFloat(akkMat, 0.0f, rowCount * BT_);
+        for (uint64_t localRow = 0; localRow < rowCount; ++localRow) {
+            const uint64_t row = rowBegin + localRow;
+            if (row >= curT) { break; }
+            LoadAsFloatRow(q_, QOffset(b, head, start + row, 0), qRow, K_);
+            LoadAsFloatRow(k_, QOffset(b, head, start + row, 0), kRow, K_);
+            LoadAsFloatRow(gk_, KVOffset(b, hv, start + row, 0, K_), gRow, K_);
+            for (uint64_t col = 0; col <= row; ++col) {
+                LoadAsFloatRow(k_, QOffset(b, head, start + col, 0), kCol, K_);
+                LoadAsFloatRow(gk_, KVOffset(b, hv, start + col, 0, K_), gCol, K_);
+                Sub(decay, gRow, gCol, static_cast<uint32_t>(K_));
+                PipeBarrier<PIPE_V>();
+                Muls(decay, decay, LN2, static_cast<uint32_t>(K_));
+                PipeBarrier<PIPE_V>();
+                Exp(decay, decay, static_cast<uint32_t>(K_));
+                PipeBarrier<PIPE_V>();
+                Mul(decay, decay, kCol, static_cast<uint32_t>(K_));
+                PipeBarrier<PIPE_V>();
+                Mul(product, qRow, decay, static_cast<uint32_t>(K_));
+                PipeBarrier<PIPE_V>();
+                ReduceSum(reduced, product, reduceTmp, static_cast<int32_t>(K_));
+                SetFlag<HardEvent::V_S>(EXP2_EVENT_ID);
+                WaitFlag<HardEvent::V_S>(EXP2_EVENT_ID);
+                const float qk = reduced.GetValue(0);
+                Mul(product, kRow, decay, static_cast<uint32_t>(K_));
+                PipeBarrier<PIPE_V>();
+                ReduceSum(reduced, product, reduceTmp, static_cast<int32_t>(K_));
+                SetFlag<HardEvent::V_S>(EXP2_EVENT_ID);
+                WaitFlag<HardEvent::V_S>(EXP2_EVENT_ID);
+                aqkMat.SetValue(localRow * BT_ + col, qk);
+                akkMat.SetValue(localRow * BT_ + col, reduced.GetValue(0));
+            }
+        }
+        SetFlag<HardEvent::S_V>(EXP2_EVENT_ID);
+        WaitFlag<HardEvent::S_V>(EXP2_EVENT_ID);
+    }
+
     __aicore__ inline void PrepareAqkAkkSolveInputRows(uint64_t b, uint64_t hv, uint64_t chunkIdx,
                                                        uint64_t start, uint64_t curT, uint64_t rowBegin,
                                                        uint64_t rowEnd, bool storeLToAkk, bool storeLToScratch)
@@ -3368,7 +3424,8 @@ private:
 #else
             false;
 #endif
-        const bool scoreIncludesBeta = scoreCanIncludeBeta && HV_ % KDA_SCORE_LANES == 0;
+        const bool scoreIncludesBeta = scoreCanIncludeBeta &&
+            !IsSameType<T, half>::value && HV_ % KDA_SCORE_LANES == 0;
         if (validRowCount < rowCount) {
             FillLocalFloat(aqkMat, 0.0f, elemCount);
             FillLocalFloat(akkMat, 0.0f, elemCount);
@@ -3397,6 +3454,11 @@ private:
             }
             SetFlag<HardEvent::MTE2_V>(mte2ToVEvent_);
             WaitFlag<HardEvent::MTE2_V>(mte2ToVEvent_);
+        }
+        if constexpr (IsSameType<T, half>::value) {
+            const uint64_t scratchBase = 3 * elemCount + BT_ + 512 + 2 * BT_;
+            RecomputeFp16CausalScores(b, hv, start, curT, rowBegin, rowCount,
+                                     aqkMat, akkMat, arena[scratchBase]);
         }
 #if defined(__CCE_AICORE__) && __CCE_AICORE__ == 310
         if (!scoreIncludesBeta) {

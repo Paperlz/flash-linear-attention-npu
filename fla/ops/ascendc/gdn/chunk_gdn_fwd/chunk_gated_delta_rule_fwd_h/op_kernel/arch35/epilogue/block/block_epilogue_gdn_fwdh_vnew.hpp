@@ -366,12 +366,12 @@ public:
             }
             AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID3 + pingpongFlag);
 
-            uint32_t nvLoops = nvActual / FLOAT_NUM_PER_REPEAT;
+            uint32_t nvLoops = CeilDiv(nvActual, FLOAT_NUM_PER_REPEAT);
             for (uint32_t nLoop = 0; nLoop < nvLoops; nLoop++) {
                 uint32_t castSrcOffset = nLoop * FLOAT_NUM_PER_REPEAT;
                 uint32_t castDstOffset = nLoop * mActualThisSubBlock * FLOAT_NUM_PER_REPEAT;
                 AscendC::LocalTensor<float> decayInput = scalarGated ? calcUbTensor : wsUbTensor;
-                AscendC::Cast(vNewDecayUbTensor[castDstOffset], decayInput[castSrcOffset], AscendC::RoundMode::CAST_RINT, FLOAT_NUM_PER_REPEAT, mActualThisSubBlock, {(uint16_t)mActualThisSubBlock, 1, 1, (uint8_t)(nvLoops * 8)});
+                AscendC::Cast(vNewDecayUbTensor[castDstOffset], decayInput[castSrcOffset], AscendC::RoundMode::CAST_RINT, Min(FLOAT_NUM_PER_REPEAT, nvActual - castSrcOffset), mActualThisSubBlock, {(uint16_t)mActualThisSubBlock, 1, 1, (uint8_t)(nvActual * sizeof(float) / 32)});
             }
 
             AscendC::PipeBarrier<PIPE_V>();
@@ -477,12 +477,12 @@ public:
                 ComputeVNew(wsUbTensorThisTile, uUbTensor, rowsThisTile * nvActual);
             }
 
-            uint32_t nvLoops = nvActual / FLOAT_NUM_PER_REPEAT;
+            uint32_t nvLoops = CeilDiv(nvActual, FLOAT_NUM_PER_REPEAT);
             for (uint32_t nLoop = 0; nLoop < nvLoops; nLoop++) {
                 uint32_t castSrcOffset = nLoop * FLOAT_NUM_PER_REPEAT;
                 uint32_t castDstOffset = nLoop * rowsThisTile * FLOAT_NUM_PER_REPEAT;
                 AscendC::LocalTensor<float> decayInput = scalarGated ? calcUbTensor : wsUbTensorThisTile;
-                AscendC::Cast(vNewDecayUbTensor[castDstOffset], decayInput[castSrcOffset], AscendC::RoundMode::CAST_RINT, FLOAT_NUM_PER_REPEAT, rowsThisTile, {(uint16_t)rowsThisTile, 1, 1, (uint8_t)(nvLoops * 8)});
+                AscendC::Cast(vNewDecayUbTensor[castDstOffset], decayInput[castSrcOffset], AscendC::RoundMode::CAST_RINT, Min(FLOAT_NUM_PER_REPEAT, nvActual - castSrcOffset), rowsThisTile, {(uint16_t)rowsThisTile, 1, 1, (uint8_t)(nvActual * sizeof(float) / 32)});
             }
 
             AscendC::PipeBarrier<PIPE_V>();

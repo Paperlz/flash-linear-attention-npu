@@ -676,9 +676,9 @@ private:
         constexpr uint16_t kMte1Event = 0;
         constexpr uint16_t kMmadEvent = 0;
         constexpr uint32_t kL1A0Offset = 0;
-        constexpr uint32_t kL1B0Offset = 64 * 128 * sizeof(ElementA);
-        constexpr uint32_t kL1A1Offset = kL1B0Offset + 128 * 128 * sizeof(ElementB);
-        constexpr uint32_t kL1B1Offset = kL1A1Offset + 64 * 64 * sizeof(ElementA);
+        const uint32_t kL1B0Offset = 64 * K_ * sizeof(ElementA);
+        const uint32_t kL1A1Offset = kL1B0Offset + K_ * 128 * sizeof(ElementB);
+        const uint32_t kL1B1Offset = kL1A1Offset + 64 * 64 * sizeof(ElementA);
 
         Catlass::Arch::Resource<KdaArchTag> resource;
         LocalTensor<ElementA> l1A0 = resource.l1Buf.template GetBufferByByte<ElementA>(kL1A0Offset);

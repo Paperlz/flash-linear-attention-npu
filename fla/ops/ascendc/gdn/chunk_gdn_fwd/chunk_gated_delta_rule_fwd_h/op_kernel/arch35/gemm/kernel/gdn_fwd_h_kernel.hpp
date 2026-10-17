@@ -97,7 +97,9 @@ public:
         tla::get<0>(L0TileShapeVTla{}) * tla::get<1>(L0TileShapeVTla{}) * sizeof(float);
     static constexpr uint32_t L0C_STAGES = 2 * L0C_TILE_BYTES <= ArchTag::L0C_SIZE ? 2 : 1;
     using DispatchPolicyTlaMulti = Gemm::MmadPingpongTlaMulti<ArchTag, false, false, L0C_STAGES>;
-    using DispatchPolicyTlaTail = Gemm::MmadPingpongTlaMulti<ArchTag, true, false, 1>;
+    // Tail GEMMs use explicit M/FIX events. The UnitFlag implementation does
+    // not initialize its l0CEventList, although operator() reads that event.
+    using DispatchPolicyTlaTail = Gemm::MmadPingpongTlaMulti<ArchTag, false, false, 1>;
     using DispatchPolicyDirectUb = Common::MmadPingpong<ArchTag, false, false, L0C_STAGES>;
     using DispatchPolicyTlaPreloadAL1B = Gemm::MmadPingpongTlaPreloadAL1B<ArchTag, true>;
 
@@ -512,6 +514,9 @@ public:
         // FwdH can run after another stage in a megakernel. Start its AIC/AIV
         // handshake only after every core has retired the preceding stage.
         AscendC::SyncAll<false>();
+        // K=16, V=256 exposes intermittent Cube WH column errors. Reuse
+        // the FP32 vector WH path for this small-reduction shape family.
+        const bool useVectorWhForSmallK = kHeadDim < 32 && vHeadDim > 128;
 
         if ASCEND_IS_AIC {
             uint32_t coreIdx = AscendC::GetBlockIdx();
@@ -547,7 +552,7 @@ public:
 
                             const GDNFwdHOffsets& cube1Offsets = cubeBlockScheduler.GetCurTaskOffsets(stream);
                             Arch::CrossCoreWaitFlag(cubeBlockScheduler.vec2Done[streamId]);
-                            if (cube1Offsets.blockTokens < 16) {
+                            if (cube1Offsets.blockTokens < 16 || useVectorWhForSmallK) {
                                 Arch::CrossCoreSetFlag<0x2, PIPE_MTE2>(
                                     cubeBlockScheduler.cube1Done[streamId]);
                                 continue;
@@ -585,6 +590,11 @@ public:
 
                             const GDNFwdHOffsets& cube1Offsets = cubeBlockScheduler.GetCurTaskOffsets(stream);
                             Arch::CrossCoreWaitFlag(cubeBlockScheduler.vec2Done[streamId]);
+                            if (useVectorWhForSmallK) {
+                                Arch::CrossCoreSetFlag<0x2, PIPE_MTE2>(
+                                    cubeBlockScheduler.cube1Done[streamId]);
+                                continue;
+                            }
                             auto vLayout = tla::MakeLayout<ElementVWork, LayoutV>(
                                 cube1Offsets.blockTokens, cube1Offsets.vBlockDim);
                             auto tensorW = tla::MakeTensor(
@@ -633,7 +643,7 @@ public:
 
                             const GDNFwdHOffsets& cube1Offsets = cubeBlockScheduler.GetCurTaskOffsets(stream);
                             Arch::CrossCoreWaitFlag(cubeBlockScheduler.vec2Done[streamId]);
-                            if (cube1Offsets.blockTokens < 16) {
+                            if (cube1Offsets.blockTokens < 16 || useVectorWhForSmallK) {
                                 Arch::CrossCoreSetFlag<0x2, PIPE_MTE2>(
                                     cubeBlockScheduler.cube1Done[streamId]);
                                 continue;
@@ -856,7 +866,10 @@ public:
                     uint32_t hBaseOffset =
                         (shapeBatchIdx * vNumHead * totalChunks + vHeadIdx * totalChunks + chunkOffset) *
                         stateBlockSize;
-                    uint32_t initialStateBaseOffset = taskIdx * stateBlockSize;
+                    uint32_t stateBatchIdx = isVariedLen
+                        ? vecBlockScheduler.GetVarlenSequenceIndex(batchIdx) : batchIdx;
+                    uint32_t initialStateBaseOffset =
+                        (stateBatchIdx * vNumHead + vHeadIdx) * stateBlockSize;
                     for (uint32_t rowOffset = rowBegin; rowOffset < rowEnd; rowOffset += rowsPerTile) {
                         uint32_t rowsThisTile = Min(rowsPerTile, rowEnd - rowOffset);
                         uint32_t stateTileElems = rowsThisTile * vHeadDim;
@@ -957,7 +970,8 @@ public:
                         const GDNFwdHOffsets& vec1Offsets = vecBlockScheduler.GetCurTaskOffsets(stream);
                         AscendC::LocalTensor<ElementV> l1VUpdate = (i == 0) ? l1VUpdatePing : l1VUpdatePong;
                         bool tailVectorPath =
-                            vec1Offsets.blockTokens < 16 && !useBoundedMmad;
+                            (vec1Offsets.blockTokens < 16 && !useBoundedMmad) ||
+                            useVectorWhForSmallK;
                         if (tailVectorPath) {
                             Arch::CrossCoreWaitFlag(
                                 vecBlockScheduler.cube1Done[streamId]);

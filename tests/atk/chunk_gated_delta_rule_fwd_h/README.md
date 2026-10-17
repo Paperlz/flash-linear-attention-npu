@@ -26,7 +26,7 @@ YAML 元信息覆盖 `ascend910b`、`ascend910_93` 和 `ascend950`，可配合�
 
 ## 默认用例
 
-本目录 `atk_chunk_gated_delta_rule_fwd_h.json` 内置 200 条泛化用例（100 个 shape × bf16/fp16），
+本目录 `atk_chunk_gated_delta_rule_fwd_h.json` 内置 202 条泛化用例（101 个 shape × bf16/fp16），
 标准为 `mixed_tolerance_bm`，SOC 为 `ascend950`。覆盖 noGVA（`HK==HV`）与 GVA（`HV>HK`）。
 
 示例（BF16 首条）：
@@ -44,3 +44,20 @@ bash tests/atk/run_test_cpu.sh -op=chunk_gated_delta_rule_fwd_h -scope=gen_cases
 ```
 
 `gen_cases` 默认传入 `-dt 100 -en 0`。所有新增工程的 marker dtype 都保留两路生成入口，生成器会把不支持 FP16 的算子改回合法 BF16 用例。
+
+K=16、V=256 的共享向量 WH 路径由 case 200/201 覆盖（BF16/FP16，HK=1、HV=2、T=65，含尾块）。
+生成包含该分支的候选集时使用 GEN_CASES_DTYPE_NUMBERS=101；冻结验收集仍以当前 JSON 为准。
+
+## R32 共享实现回归（2026-10-17）
+
+与 KDA 同一 `feat/chunk-kda-fwd-precision` 完整 wheel、Ascend950PR/CANN9.1.0-beta.3。
+共享修改涉及空序列状态寻址、tail事件、Vnew打包及 K<32/V>128 的 Vector WH。
+原 CPU FP64 标杆、输入范围和 AscendOpTest `compare_default` 未改。
+冻结202例/404输出全部通过；另有原48例/96输出同机回归全部通过，缺失用例和输出均为0。
+新增200/201只补充已支持K16/V256的共享Vector WH分支，分别为BF16/FP16，T65含完整块与尾块；原200例未修改。
+MSS复用已有case0（V128/key1）和case200（V256/key2），不另外生成精度输入。
+
+性能模型0：B1/HK4/HV4/T512/K128/V128/BF16/chunk64，串行同机完整包各100样本，
+主核 R31 58.39304 μs → R32 59.04029 μs（std0.59453），比值1.01108；小幅增加1.1%，KDA目标路径性能保持。
+该模型没有另设绝对性能目标，不将该变化称为加速。50轮确定性原case0通过，XLSX实际确定性值为真。
+两key全block memcheck排在KDA后执行，尚未计通过；case200的50轮确定性另行补测。

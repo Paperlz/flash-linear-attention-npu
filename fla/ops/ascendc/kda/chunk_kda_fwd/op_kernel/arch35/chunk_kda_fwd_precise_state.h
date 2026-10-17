@@ -49,6 +49,7 @@ public:
         auto v2m2 = pipe_.template AllocEventID<HardEvent::V_MTE2>();
         auto v2m3 = pipe_.template AllocEventID<HardEvent::V_MTE3>();
         auto m32v = pipe_.template AllocEventID<HardEvent::MTE3_V>();
+        auto m32m2 = pipe_.template AllocEventID<HardEvent::MTE3_MTE2>();
         __gm__ int64_t *cu = reinterpret_cast<__gm__ int64_t *>(cuSeqlens);
         for (uint64_t work = core; work < tiling.seqNum * tiling.vHeadNum; work += cores) {
             const uint64_t seq = work / tiling.vHeadNum;
@@ -119,11 +120,14 @@ public:
             DataCopyPad(final_[stateBase], state, outParams);
             SetFlag<HardEvent::MTE3_V>(m32v);
             WaitFlag<HardEvent::MTE3_V>(m32v);
+            SetFlag<HardEvent::MTE3_MTE2>(m32m2);
+            WaitFlag<HardEvent::MTE3_MTE2>(m32m2);
         }
         pipe_.template ReleaseEventID<HardEvent::MTE2_V>(m2v);
         pipe_.template ReleaseEventID<HardEvent::V_MTE2>(v2m2);
         pipe_.template ReleaseEventID<HardEvent::V_MTE3>(v2m3);
         pipe_.template ReleaseEventID<HardEvent::MTE3_V>(m32v);
+        pipe_.template ReleaseEventID<HardEvent::MTE3_MTE2>(m32m2);
     }
 
 private:

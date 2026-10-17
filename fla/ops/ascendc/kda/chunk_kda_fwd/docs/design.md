@@ -359,3 +359,20 @@ AIV 的 useDirectScoreUb 也错误跳过通用 solve 输入准备。
 不改变双 head 所有权、缓冲容量、工作区布局、数学结果或 ready/free 次数。目标 key2 性能路径完全保留。
 R01–R21 差异评审：把 producer/consumer 的选择条件对齐，不新增数据流或同步。
 先验证原5108–5110与18 smoke，再继续既定矩阵；禁止把已超时的 Fix4 算作通过。
+
+
+## R32 精度修复
+
+保持公开接口、输入范围、CPU FP64 标杆及 AscendOpTest 默认容差。
+
+- 空序列：FwdH 仍按非空序列紧凑调度，但 initial/final_state 使用原始逻辑序列编号；预填充与递推共用该映射。
+- 精确最终状态：相邻 work 的 UB 复用增加 MTE3_MTE2 完成事件，保护下次初态装载；原 MTE3_V 依赖继续保护 Vector 初始化，退出时释放事件。
+- K256 完整块：Finalize 非预取路径按实际 K 预留 Q/H 的 L1 区间，避免 64×K 的 Q 覆盖后续 H。最大 120 KiB；K128 地址和专用预取路径保持不变。
+- 尾块：共享 GDN tail GEMM 改用显式 M/FIX 同步，避免 UnitFlag 路径读取未初始化的 l0CEventList。
+- V16/32/48：Vnew NZ 打包按 64 列向上取整，尾片使用实际 mask，源行步长使用 nvActual；不再因循环次数为零而保留旧 U。
+- FP16 score：从原始 q/k 与 FP32 gate 差重算因果 Aqk/Akk，避免中途转 BF16 损失尾数。复用 solve 尚未使用的 scratch；最大 scratch 末端小于 32768 floats；beta 仅应用一次。BF16 路径不变。
+- K<32、V>128：复用既有 FP32 Vector WH 计算覆盖所有 chunk 长度；AIC 跳过 WH GEMM并发布原交接事件，AIV 消费后计算并进入原 Vnew epilogue。原 Cube WH 间歇列误差的底层原因尚未确认。K128/V128 目标性能路径不变。
+
+共享头文件的引用范围为 KDA 与独立 GDN FwdH。完整 wheel 覆盖八组 KDA dtype 与两组 GDN dtype，并自动构建 GateCumsum 依赖。
+固定20、泛化20、历史465、原失败12及共享 GDN202/48 均通过原始判据；这些集合有重叠，不能相加作为独立用例数。
+性能与确定性数据见各算子 ATK README；MSS 完成前不将阶段05记作正式完成。

@@ -1,6 +1,6 @@
 """chunk_gated_delta_rule_fwd_h 的 ATK 泛化用例生成器。
 
-基于 GDN 泛化用例表整理的 100 个 shape × bf16/fp16 = 200 条；本文件内自维护 PROFILES。
+基于 GDN 泛化用例表整理的 101 个 shape × bf16/fp16 = 202 条；本文件内自维护 PROFILES。
 case 按计算规模从小到大排序，便于从最小 case 开始逐步验证。
 """
 
@@ -222,6 +222,8 @@ PROFILES = [
     {'name': 'BSND_noGVA_V128_18', 'dtype': 'fp16', 'B': 1, 'HK': 8, 'HV': 8, 'T': 65536, 'K': 128, 'V': 128, 'chunk_size': 64, 'op': 'chunk_gated_delta_rule_fwd_h', 'case_id': 197, 'seed': 20261014, 'route': 'ascendc', 'soc': 'ascend950'},
     {'name': 'BSND_noGVA_V128_18_cs128', 'dtype': 'bf16', 'B': 1, 'HK': 8, 'HV': 8, 'T': 65536, 'K': 128, 'V': 128, 'chunk_size': 128, 'op': 'chunk_gated_delta_rule_fwd_h', 'case_id': 198, 'seed': 20261015, 'route': 'ascendc', 'soc': 'ascend950'},
     {'name': 'BSND_noGVA_V128_18_cs128', 'dtype': 'fp16', 'B': 1, 'HK': 8, 'HV': 8, 'T': 65536, 'K': 128, 'V': 128, 'chunk_size': 128, 'op': 'chunk_gated_delta_rule_fwd_h', 'case_id': 199, 'seed': 20261016, 'route': 'ascendc', 'soc': 'ascend950'},
+    {'name': 'small_k_wide_v_tail', 'dtype': 'bf16', 'B': 1, 'HK': 1, 'HV': 2, 'T': 65, 'K': 16, 'V': 256, 'chunk_size': 64, 'op': 'chunk_gated_delta_rule_fwd_h', 'case_id': 200, 'seed': 20260812, 'route': 'ascendc', 'soc': 'ascend950'},
+    {'name': 'small_k_wide_v_tail', 'dtype': 'fp16', 'B': 1, 'HK': 1, 'HV': 2, 'T': 65, 'K': 16, 'V': 256, 'chunk_size': 64, 'op': 'chunk_gated_delta_rule_fwd_h', 'case_id': 201, 'seed': 20260812, 'route': 'ascendc', 'soc': 'ascend950'},
 ]
 
 

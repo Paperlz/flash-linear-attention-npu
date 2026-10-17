@@ -236,6 +236,7 @@ struct BlockSchedulerGdnFwdH {
             if (batchTokens > 0) {
                 int64_t batchChunks = (batchTokens + chunkSize - 1) / chunkSize;
                 if (actualBatch == compactBatchIdx) {
+                    stream.tokenBatchIdx = b - 1;
                     stream.chunkOffset = static_cast<uint32_t>(chunkPrefix);
                     stream.batchChunks = static_cast<uint32_t>(batchChunks);
                     stream.tokenOffset = static_cast<uint32_t>(prevSeq);
@@ -251,6 +252,13 @@ struct BlockSchedulerGdnFwdH {
         stream.batchChunks = 0;
         stream.tokenOffset = 0;
         stream.batchTokens = 0;
+    }
+
+    CATLASS_DEVICE
+    uint32_t GetVarlenSequenceIndex(uint32_t compactBatchIdx) {
+        GDNFwdHStream stream{};
+        ResolveVarlenSequence(compactBatchIdx, stream);
+        return stream.tokenBatchIdx;
     }
 
     CATLASS_DEVICE
@@ -305,8 +313,9 @@ struct BlockSchedulerGdnFwdH {
         offset.isFinalState = stream.chunkIdx == (stream.batchChunks - 1);
         uint32_t vBlockOffset = 0;
         uint32_t vBlockDim = vBlockSize;
-        offset.initialStateOffset = (stream.batchIdx * vNumHead + stream.vHeadIdx) * kHeadDim * vHeadDim + vBlockOffset;
-        offset.finalStateOffset = (stream.batchIdx * vNumHead + stream.vHeadIdx) * kHeadDim * vHeadDim + vBlockOffset;
+        const uint32_t stateBatchIdx = isVariedLen ? stream.tokenBatchIdx : stream.batchIdx;
+        offset.initialStateOffset = (stateBatchIdx * vNumHead + stream.vHeadIdx) * kHeadDim * vHeadDim + vBlockOffset;
+        offset.finalStateOffset = (stateBatchIdx * vNumHead + stream.vHeadIdx) * kHeadDim * vHeadDim + vBlockOffset;
         offset.hSrcOffset = (stream.shapeBatchIdx * vNumHead * totalChunks + stream.vHeadIdx * totalChunks + stream.chunkOffset + stream.chunkIdx) * kHeadDim * vHeadDim + vBlockOffset;
         offset.hDstOffset = offset.hSrcOffset + kHeadDim * vHeadDim;
         if (storeFinalState && offset.isFinalState) {
